@@ -1,0 +1,102 @@
+{
+  "pipeline": "detector_crop_yolo26pose_framexy_body110_cnn_bilstm",
+  "feature_version": "body110",
+  "feature_dim": 110,
+  "window_size": 30,
+  "class_names": [
+    "boxing",
+    "carrying",
+    "clapping",
+    "digging",
+    "jogging",
+    "running",
+    "throwing",
+    "walking",
+    "waving"
+  ],
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "number_of_runs": 5,
+  "standard_deviation": "sample_std_ddof_1",
+  "model_selection_uses_test": false,
+  "train_sequences_per_epoch": 20630,
+  "uses_all_train_sequences": true,
+  "selection_metric_per_run": "validation_macro_f1",
+  "representative_seed": 2,
+  "representative_selection": "highest validation sequence Macro F1",
+  "pytorch_onnx_max_difference": 2.86102294921875e-06,
+  "pytorch_onnx_agreement": 1.0,
+  "onnx_sha256": "03c5e465ffd26ed032f1a60eb47f6cceb81eea9789c7cc1bd489c77a0a45861f",
+  "preprocessed_root": "/kaggle/input/datasets/wafabila/preprocessing-final",
+  "mean_std_results": [
+    {
+      "metric": "validation_sequence_accuracy",
+      "mean": 0.9797223599405058,
+      "std": 0.0004073296163895641,
+      "mean_percent": 97.97223599405058,
+      "std_percent": 0.040732961638956414,
+      "formatted": "97.97% ± 0.04%"
+    },
+    {
+      "metric": "validation_sequence_macro_f1",
+      "mean": 0.9797245541259991,
+      "std": 0.00045734930939396066,
+      "mean_percent": 97.97245541259991,
+      "std_percent": 0.04573493093939607,
+      "formatted": "97.97% ± 0.05%"
+    },
+    {
+      "metric": "test_sequence_accuracy",
+      "mean": 0.9798416126709864,
+      "std": 0.0023049403302493874,
+      "mean_percent": 97.98416126709864,
+      "std_percent": 0.23049403302493873,
+      "formatted": "97.98% ± 0.23%"
+    },
+    {
+      "metric": "test_sequence_macro_f1",
+      "mean": 0.9798045951244599,
+      "std": 0.0023161299262112016,
+      "mean_percent": 97.98045951244599,
+      "std_percent": 0.23161299262112017,
+      "formatted": "97.98% ± 0.23%"
+    },
+    {
+      "metric": "validation_video_accuracy",
+      "mean": 0.9945578231292517,
+      "std": 0.0030422693571425744,
+      "mean_percent": 99.45578231292517,
+      "std_percent": 0.30422693571425746,
+      "formatted": "99.46% ± 0.30%"
+    },
+    {
+      "metric": "validation_video_macro_f1",
+      "mean": 0.9944390137938525,
+      "std": 0.0031086857947211235,
+      "mean_percent": 99.44390137938525,
+      "std_percent": 0.3108685794721123,
+      "formatted": "99.44% ± 0.31%"
+    },
+    {
+      "metric": "test_video_accuracy",
+      "mean": 0.99,
+      "std": 0.0,
+      "mean_percent": 99.0,
+      "std_percent": 0.0,
+      "formatted": "99.00% ± 0.00%"
+    },
+    {
+      "metric": "test_video_macro_f1",
+      "mean": 0.9903381642512077,
+      "std": 0.0,
+      "mean_percent": 99.03381642512076,
+      "std_percent": 0.0,
+      "formatted": "99.03% ± 0.00%"
+    }
+  ]
+}

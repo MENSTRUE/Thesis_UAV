@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/
+~$*
+
+# Runtime output
+output/
+outputs/
+runs/
+logs/
+*.log
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local thesis manuscripts are not part of the public code repository
+docs/*.docx
+
+# Private biometric data: never publish
+face_assets/database/
+face_assets/**/*.jpg
+face_assets/**/*.jpeg
+face_assets/**/*.png
+face_assets/**/*.npy
+
+# Credentials and local configuration
+.env
+.env.*
+kaggle.json
+credentials.json
+secrets.json
+
+# TensorRT cache/build artifacts
+*.timing
+*.cache

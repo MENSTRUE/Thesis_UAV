@@ -37,7 +37,7 @@ drone-human_gesture/
 │   ├── full_pipeline.py    # pipeline penuh off-board
 │   ├── tello_control.py    # kontrol Tello + HUD + foto/rekaman
 │   ├── face_system.py      # face recognition + anti-spoofing
-│   ├── runtime_utils.py    # pemilihan provider ONNX/device YOLO
+│   ├── runtime_utils.py    # pemilihan provider ONNX Runtime
 │   └── diagnose_runtime.py # pemeriksaan runtime
 ├── face_assets/
 ├── models/
@@ -116,8 +116,9 @@ sama.
 python main.py diagnose
 ```
 
-Menampilkan versi OpenCV, Ultralytics, ONNX Runtime + provider (TensorRT/CUDA/
-DML/CPU), PyAV, PyTorch/CUDA, dan status aset wajah (model + jumlah identitas).
+Menampilkan versi OpenCV, ONNX Runtime + provider (CUDA/DML/CPU), PyAV, dan
+status aset wajah (model + jumlah identitas). YOLO deteksi/pose dan HAR semuanya
+berjalan lewat ONNX Runtime (tanpa PyTorch/Ultralytics).
 
 ## Pengujian langsung
 

@@ -1,5 +1,9 @@
+# ONNX Runtime GPU (CUDA 12.x). Pasang SETELAH requirements-full.txt /
+# requirements-har.txt. DLL cudart/cublas/cudnn disuplai paket nvidia-* berikut
+# (onnxruntime-gpu tidak mem-bundle-nya).
 onnxruntime-gpu==1.20.2
 nvidia-cublas-cu12
+nvidia-cuda-nvrtc-cu12
 nvidia-cuda-runtime-cu12
 nvidia-cudnn-cu12
 nvidia-cufft-cu12

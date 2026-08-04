@@ -29,14 +29,18 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 import onnxruntime as ort
-from ultralytics import YOLO
 
 from body110 import MODEL_FEATURE_DIM, RAW_FEATURE_DIM, prepare_sequence
 
 try:
-    from runtime_utils import choose_yolo_device, resolve_ort_providers, setup_cuda_paths
+    from runtime_utils import resolve_ort_providers, setup_cuda_paths
 except ImportError:
-    from src.runtime_utils import choose_yolo_device, resolve_ort_providers, setup_cuda_paths
+    from src.runtime_utils import resolve_ort_providers, setup_cuda_paths
+
+try:
+    from yolo_onnx import IoUTracker, YoloDetector, YoloPose
+except ImportError:
+    from src.yolo_onnx import IoUTracker, YoloDetector, YoloPose
 
 try:
     from tello_control import (BATTERY_CRITICAL, TRIM_MAX, TRIM_STEP,
@@ -311,21 +315,15 @@ def padded_box(box, width, height):
     )
 
 
-def pose_to_raw51(frame, box, pose_model, pose_imgsz, pose_conf, device):
+def pose_to_raw51(frame, box, pose_model, pose_imgsz, pose_conf):
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = padded_box(box, width, height)
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return np.zeros(RAW_FEATURE_DIM, np.float32), False
-    result = pose_model.predict(
-        crop, imgsz=pose_imgsz, conf=pose_conf, iou=0.50, classes=[0],
-        max_det=5, device=device, verbose=False,
-    )[0]
-    if result.boxes is None or result.keypoints is None or len(result.boxes) == 0:
+    boxes, scores, keypoints = pose_model.run(crop, pose_imgsz, pose_conf, max_det=5)
+    if len(boxes) == 0:
         return np.zeros(RAW_FEATURE_DIM, np.float32), False
-    boxes = result.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
-    scores = result.boxes.conf.detach().cpu().numpy().astype(np.float32)
-    keypoints = result.keypoints.data.detach().cpu().numpy().astype(np.float32)
     areas = np.maximum(boxes[:, 2] - boxes[:, 0], 0) * np.maximum(boxes[:, 3] - boxes[:, 1], 0)
     best = int(np.argmax(areas * np.maximum(scores, 1e-6)))
     pose = keypoints[best, :NUM_KEYPOINTS, :3].copy()
@@ -416,9 +414,10 @@ def main(argv: Optional[List[str]] = None):
     ]:
         require_file(path, label)
 
-    device = choose_yolo_device(args.device)
-    detector = YOLO(str(args.detector))
-    pose_model = YOLO(str(args.pose))
+    providers = resolve_ort_providers()
+    detector = YoloDetector(str(args.detector), providers)
+    pose_model = YoloPose(str(args.pose), providers)
+    tracker = IoUTracker()
     har_session = make_ort_session(args.har)
     mean = np.load(args.mean).astype(np.float32).reshape(-1)
     std = np.load(args.std).astype(np.float32).reshape(-1)
@@ -437,7 +436,7 @@ def main(argv: Optional[List[str]] = None):
     print("=" * 72)
     print("ARSITEKTUR : OFF-BOARD (Tello adalah kamera; komputasi di ground station)")
     print("PROFILE    :", args.profile, profile)
-    print("YOLO DEVICE:", device)
+    print("YOLO ORT   :", detector.provider, "/", pose_model.provider)
     print("HAR ORT    :", har_session.get_providers())
     print("FACE       :", "aktif" if face_system else "nonaktif")
     print("=" * 72)
@@ -476,21 +475,17 @@ def main(argv: Optional[List[str]] = None):
                 source.battery_check()
 
             tick = time.perf_counter()
-            tracked = detector.track(
-                frame, persist=True, tracker=args.tracker, classes=[0],
-                conf=args.detector_conf, iou=0.50, imgsz=profile.detector_imgsz,
-                max_det=profile.max_people, device=device, verbose=False,
-            )[0]
+            dets = detector.run(
+                frame, profile.detector_imgsz, args.detector_conf, 0.50,
+                profile.max_people,
+            )
             timers.record("detector_bytetrack", time.perf_counter() - tick)
 
             current_boxes = {}
             detections = []
-            if tracked.boxes is not None and len(tracked.boxes) > 0:
-                boxes = tracked.boxes.xyxy.detach().cpu().numpy()
-                confs = tracked.boxes.conf.detach().cpu().numpy()
-                ids_tensor = tracked.boxes.id
-                ids = ids_tensor.detach().cpu().numpy().astype(int) if ids_tensor is not None else np.arange(len(boxes))
-                detections = list(zip(boxes, confs, ids))
+            if dets:
+                ids = tracker.update([d[0] for d in dets])
+                detections = [(d[0], d[1], track_id) for d, track_id in zip(dets, ids)]
                 current_boxes = {int(track_id): box for box, _, track_id in detections}
 
             if face_system is not None and frame_index % profile.face_interval == 0:
@@ -505,7 +500,7 @@ def main(argv: Optional[List[str]] = None):
                     tick = time.perf_counter()
                     raw51, valid = pose_to_raw51(
                         frame, box, pose_model, profile.pose_imgsz,
-                        args.pose_conf, device,
+                        args.pose_conf,
                     )
                     timers.record("pose", time.perf_counter() - tick)
                     last_pose[track_id] = raw51
@@ -596,7 +591,7 @@ def main(argv: Optional[List[str]] = None):
         "frames": frame_index,
         "wall_time_seconds": wall_time,
         "throughput_fps": frame_index / wall_time,
-        "yolo_device": str(device),
+        "yolo_ort": [detector.provider, pose_model.provider],
         "onnx_providers": har_session.get_providers(),
         "face_enabled": bool(face_system),
         "platform": platform.platform(),

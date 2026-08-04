@@ -543,13 +543,26 @@ class DroneControl:
         if self._decoder:
             self._decoder.stop()
             self._decoder = None
+        # Cleanup non-blocking: streamoff/land fire-and-forget lalu tutup
+        # socket langsung. streamoff() blocking bisa hang ~28s di drone yang
+        # mulai tidak respons dan meninggalkan sesi zombie (command run
+        # berikutnya ditolak diam-diam).
         if self._is_flying:
-            self.land()
+            try:
+                self.tello.send_command_without_return("land")
+            except Exception:
+                pass
+            self._is_flying = False
         try:
-            self.tello.streamoff()
+            self.tello.send_command_without_return("streamoff")
         except Exception:
             pass
-        self.tello.end()
+        from djitellopy import tello as _dt
+        for sock in (getattr(_dt, "client_socket", None), getattr(_dt, "state_socket", None)):
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def clamp(v, lo, hi):

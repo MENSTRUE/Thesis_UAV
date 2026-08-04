@@ -24,17 +24,6 @@ def setup_cuda_paths() -> None:
             os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
 
 
-def choose_yolo_device(requested: str = "auto"):
-    """auto/cpu/0/1/... -> nilai device yang dipahami Ultralytics."""
-    if requested != "auto":
-        return int(requested) if str(requested).isdigit() else requested
-    try:
-        import torch
-        return 0 if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
-
-
 def resolve_ort_providers(prefer_dml=True):
     """Daftar provider ONNX Runtime urutan prioritas: CUDA > DML > CPU.
 

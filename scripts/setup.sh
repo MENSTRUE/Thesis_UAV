@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Setup Linux/macOS. Jalankan dari root proyek.
-#   ./scripts/setup.sh            -> default: GPU nVidia (CUDA)
+#   ./scripts/setup.sh            -> default: GPU nVidia (onnxruntime-gpu CUDA)
 #   ./scripts/setup.sh -CPU       -> ONNX Runtime CPU saja
 #   ./scripts/setup.sh -DML       -> ONNX Runtime DirectML
 #   ./scripts/setup.sh -Pip       -> pakai pip, bukan uv
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export UV_LINK_MODE=copy  # hindari warning hardlink antar filesystem
 
 CPU=0
 DML=0
@@ -55,33 +56,20 @@ else
     uv pip install -p .venv -r requirements/requirements-har.txt
 fi
 
-TORCH_CU124="https://download.pytorch.org/whl/cu124"
-TORCH_CPU="https://download.pytorch.org/whl/cpu"
 if [ "$DML" -eq 1 ]; then
     echo "[deps] DirectML..."
-    if [ "$PIP" -eq 1 ]; then
-        "$VENV/python" -m pip install -r requirements/requirements-dml.txt -r requirements/requirements-full.txt
-    else
-        uv pip install -p .venv -r requirements/requirements-dml.txt -r requirements/requirements-full.txt
-    fi
+    VARIANT="dml"
 elif [ "$CPU" -eq 1 ]; then
     echo "[deps] CPU..."
-    if [ "$PIP" -eq 1 ]; then
-        "$VENV/python" -m pip install torch torchvision --index-url "$TORCH_CPU"
-        "$VENV/python" -m pip install -r requirements/requirements-full.txt -r requirements/requirements-cpu.txt
-    else
-        uv pip install -p .venv torch torchvision --index-url "$TORCH_CPU"
-        uv pip install -p .venv -r requirements/requirements-full.txt -r requirements/requirements-cpu.txt
-    fi
+    VARIANT="cpu"
 else
-    echo "[deps] GPU (nvidia) - torch cu124 dulu..."
-    if [ "$PIP" -eq 1 ]; then
-        "$VENV/python" -m pip install torch torchvision --index-url "$TORCH_CU124"
-        "$VENV/python" -m pip install -r requirements/requirements-full.txt -r requirements/requirements-gpu.txt
-    else
-        uv pip install -p .venv torch torchvision --index-url "$TORCH_CU124"
-        uv pip install -p .venv -r requirements/requirements-full.txt -r requirements/requirements-gpu.txt
-    fi
+    echo "[deps] GPU (nvidia)..."
+    VARIANT="gpu"
+fi
+if [ "$PIP" -eq 1 ]; then
+    "$VENV/python" -m pip install -r requirements/requirements-full.txt -r "requirements/requirements-$VARIANT.txt"
+else
+    uv pip install -p .venv -r requirements/requirements-full.txt -r "requirements/requirements-$VARIANT.txt"
 fi
 
 echo ""

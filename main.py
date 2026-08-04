@@ -28,41 +28,33 @@ def _pick_video():
         print("Nomor tidak valid.")
 
 
-def _auto_profile() -> str:
+def _ort_providers():
+    sys.path.insert(0, str(ROOT / "src"))
+    from runtime_utils import resolve_ort_providers, setup_cuda_paths
+    setup_cuda_paths()
     try:
-        import torch
-
-        if torch.cuda.is_available():
-            return "laptop"
+        return resolve_ort_providers()
     except Exception:
-        pass
+        return ["CPUExecutionProvider"]
+
+
+def _auto_profile() -> str:
+    if any(p in _ort_providers() for p in ("CUDAExecutionProvider", "DmlExecutionProvider")):
+        return "laptop"
     return "nano"
 
 
 def _check_gpu():
-    """Cetak status GPU di startup; peringatkan bila CUDA tidak aktif."""
-    sys.path.insert(0, str(ROOT / "src"))
-    from runtime_utils import setup_cuda_paths
-    setup_cuda_paths()
-    torch_ok, torch_name = False, ""
-    try:
-        import torch
-        torch_ok = torch.cuda.is_available()
-        torch_name = torch.cuda.get_device_name(0) if torch_ok else ""
-    except Exception:
-        pass
-    ort_cuda = False
-    try:
-        import onnxruntime as ort
-        ort_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
-    except Exception:
-        pass
-    if torch_ok and ort_cuda:
-        print(f"[GPU] Aktif: {torch_name} (torch CUDA + onnxruntime CUDAExecutionProvider)")
+    """Cetak status GPU di startup; peringatkan bila GPU tidak aktif."""
+    providers = _ort_providers()
+    if "CUDAExecutionProvider" in providers:
+        print("[GPU] Aktif: onnxruntime CUDAExecutionProvider")
+    elif "DmlExecutionProvider" in providers:
+        print("[GPU] Aktif: onnxruntime DmlExecutionProvider (DirectML)")
     else:
-        print("[!] GPU TIDAK aktif (torch_cuda=%s, ort_cuda=%s)." % (torch_ok, ort_cuda))
-        print("    Untuk inferensi GPU, jalankan via:  uv run python main.py")
-        print("    (python global/3.14 biasanya CPU-only). Lanjut dengan CPU...\n")
+        print("[!] GPU tidak terdeteksi (onnxruntime CPU saja).")
+        print("    Jalankan scripts/setup.ps1 (default GPU) atau -DML untuk DirectML.")
+        print("    Lanjut dengan CPU...\n")
 
 
 def run_pipeline(argv):

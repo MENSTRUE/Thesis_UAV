@@ -95,7 +95,7 @@ Alternatif manual (uv):
 
 ```bash
 uv venv --python 3.11 .venv
-uv pip install -p .venv -r requirements/requirements-full.txt
+uv pip install -p .venv -r requirements/requirements-full.txt -r requirements/requirements-gpu.txt
 ```
 
 ## 4. Uji environment

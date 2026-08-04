@@ -1,0 +1,2 @@
+onnxruntime-directml>=1.20
+# Pilih salah satu: GPU nVidia (requirements-gpu) ATAU ini (DML universal/DX12).

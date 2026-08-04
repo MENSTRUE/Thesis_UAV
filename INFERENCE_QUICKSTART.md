@@ -13,24 +13,28 @@ src/
 ├── diagnose_runtime.py
 ├── export_yolo_tensorrt.py
 ├── full_pipeline.py
-└── offboard_tello_har.py
+├── tello_control.py
+├── face_system.py
+└── runtime_utils.py
 
 requirements/
 ├── requirements-full.txt
-└── requirements-har.txt
+├── requirements-har.txt
+├── requirements-gpu.txt
+└── requirements-dml.txt
 
 models/
 ├── README.md
-├── yolov8s.pt
-├── yolo26s-pose.pt
+├── yolov8s_512_fp32.onnx
+├── yolo26s-pose_512_fp32.onnx
 ├── har_window_30_representative.onnx
 ├── feature_mean.npy
 ├── feature_std.npy
 └── pipeline_metadata.json
 ```
 
-`pipeline_metadata.json` harus memuat `class_mapping`. Jika nama file yang
-tersedia adalah `class_mapping.json`, file tersebut dapat digunakan langsung.
+`pipeline_metadata.json` memuat array `class_names`; `class_mapping.json`
+dengan bentuk lain-nya juga dikenali.
 
 File notebook yang sebaiknya ikut disimpan:
 
@@ -58,10 +62,11 @@ Untuk modul wajah opsional:
 face_assets/models/MiniFASNetV2.onnx
 ```
 
-Database embedding wajah disimpan lokal dengan struktur:
+Database embedding wajah disimpan lokal dengan struktur cent-atroid per
+identitas:
 
 ```text
-face_assets/database/embeddings/<nama>/emb_0001.npy
+face_assets/database/embeddings/<nama>/anchor_centroid.npy
 ```
 
 Jangan push database embedding atau foto wajah pribadi ke repository publik.
@@ -73,25 +78,30 @@ Gunakan Python 3.11.
 Windows PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements/requirements-full.txt
+./scripts/setup.ps1          # GPU NVIDIA (default)
+./scripts/setup.ps1 -CPU
+./scripts/setup.ps1 -DML
 ```
 
 Linux:
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements/requirements-full.txt
+./scripts/setup.sh           # GPU NVIDIA (default)
+./scripts/setup.sh -CPU
+./scripts/setup.sh -DML
+```
+
+Alternatif manual (uv):
+
+```bash
+uv venv --python 3.11 .venv
+uv pip install -p .venv -r requirements/requirements-full.txt
 ```
 
 ## 4. Uji environment
 
 ```bash
-python src/diagnose_runtime.py
+python main.py diagnose
 ```
 
 ## 5. Inference video
@@ -114,6 +124,12 @@ python src/full_pipeline.py --source video --video "videos/uji.mp4" --profile qu
 
 Hasil video disimpan secara default ke `output/full_pipeline.mp4`, sedangkan
 laporan performa disimpan ke `output/benchmark.json`.
+
+Cara paling sederhana — menu interaktif (pilih video dari `videos/`):
+
+```bash
+python main.py
+```
 
 ## 6. Inference webcam
 
@@ -140,11 +156,12 @@ wajah sesaat gagal mendeteksi.
 ## 8. Inference DJI Tello tanpa takeoff otomatis
 
 ```bash
-python src/full_pipeline.py --source tello --profile nano --mapping models/pipeline_metadata.json
+python main.py tello
 ```
 
 Opsi `--allow-takeoff` hanya digunakan ketika memang ingin mengizinkan perintah
-takeoff dari aplikasi dan pengujian dilakukan di area yang aman.
+takeoff dari aplikasi dan pengujian dilakukan di area yang aman. Tanpa flag
+tersebut, Tello hanya menerima stream dan kontrol tanpa terbang.
 
 ## 9. Benchmark tanpa tampilan dan tanpa menyimpan video
 

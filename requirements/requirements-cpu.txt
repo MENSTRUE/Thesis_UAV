@@ -1,0 +1,2 @@
+# ONNX Runtime CPU. Pasang SETELAH requirements-full.txt / requirements-har.txt.
+onnxruntime>=1.20

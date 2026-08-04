@@ -45,3 +45,8 @@ secrets.json
 # TensorRT cache/build artifacts
 *.timing
 *.cache
+
+# Drone captures & config (runtime state)
+captures/
+videos/
+config.json

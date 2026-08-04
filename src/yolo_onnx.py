@@ -35,12 +35,15 @@ def letterbox(im: np.ndarray, new_shape: int = 512, color: Tuple[int, int, int] 
 
 def scale_coords(arr: np.ndarray, ratio: float, left: float, top: float,
                  width: int, height: int) -> np.ndarray:
-    """Mapping koordinat (x, y) dari ruang padded ke frame asli + clip."""
+    """Mapping koordinat (x, y) dari ruang padded ke frame asli + clip.
+
+    Sama dengan scale_boxes ultralytics: semua koordinat x (kolom 0, 2) dan
+    y (kolom 1, 3) dikurangi padding lalu dibagi ratio."""
     out = arr.astype(np.float32).copy()
     if out.ndim == 1:
         out = out[None]
-    out[..., 0] = np.clip((out[..., 0] - left) / ratio, 0, max(width - 1, 1))
-    out[..., 1] = np.clip((out[..., 1] - top) / ratio, 0, max(height - 1, 1))
+    out[..., [0, 2]] = np.clip((out[..., [0, 2]] - left) / ratio, 0, max(width - 1, 1))
+    out[..., [1, 3]] = np.clip((out[..., [1, 3]] - top) / ratio, 0, max(height - 1, 1))
     return out
 
 
@@ -186,3 +189,20 @@ class IoUTracker:
 
         self._tracks = [t for t in self._tracks if t["misses"] <= self.max_misses]
         return ids
+
+
+def _self_check() -> None:
+    """Cek mapping koordinat: bbox di ruang padded harus kembali tepat ke asli."""
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    padded, ratio, left, top = letterbox(frame, 512)
+    assert padded.shape == (512, 512, 3), padded.shape
+    box = np.array([[400.0, 300.0, 100.0, 150.0]])  # xyxy di ruang 512x512
+    scaled = scale_coords(box, ratio, left, top, frame.shape[1], frame.shape[0])
+    expect = (box - np.array([left, top, left, top], np.float32)) / ratio
+    assert np.allclose(scaled, expect, atol=1e-3), (scaled, expect)
+    assert scaled[0, 0] >= 0 and scaled[0, 3] <= 720, scaled
+    print("yolo_onnx self-check OK (letterbox + scale_coords)")
+
+
+if __name__ == "__main__":
+    _self_check()

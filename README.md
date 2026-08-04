@@ -12,7 +12,7 @@ ground station.
 
 ```text
 Video/Tello
-  -> OpenCV
+  -> OpenCV / PyAV
   -> YOLOv8s person detection
   -> ByteTrack (Track ID)
   -> crop manusia
@@ -30,102 +30,118 @@ Video/Tello
 ## Struktur repository
 
 ```text
-Thesis_UAV/
+drone-human_gesture/
+├── main.py                 # entrypoint sederhana (menu interaktif)
 ├── notebooks/
 ├── src/
-├── requirements/
-├── models/
+│   ├── full_pipeline.py    # pipeline penuh off-board
+│   ├── tello_control.py    # kontrol Tello + HUD + foto/rekaman
+│   ├── face_system.py      # face recognition + anti-spoofing
+│   ├── runtime_utils.py    # pemilihan provider ONNX/device YOLO
+│   └── diagnose_runtime.py # pemeriksaan runtime
 ├── face_assets/
+├── models/
+├── requirements/
+├── scripts/                # setup.ps1 / setup.sh
 ├── docs/
 └── tools/
 ```
 
-## File utama
+## Instalasi
 
-- `notebooks/FULL_ONNX_HAR_UAV_Kaggle.ipynb`: pipeline lengkap, termasuk
-  multi-person tracking, HAR, wajah, liveness, video, CSV, dan benchmark.
-- `notebooks/YOLO_Detector_Pose_Export_ONNX_Kaggle.ipynb`: ekspor YOLO detector
-  dan pose ke ONNX secara aman.
-- `src/full_pipeline.py`: aplikasi off-board untuk video, webcam, atau DJI Tello.
-- `src/body110.py`: transformasi Raw51 menjadi Body110 yang harus identik antara
-  training dan inference.
-- `src/diagnose_runtime.py`: pemeriksaan CUDA dan ONNX Runtime provider.
+Dibutuhkan Python 3.11. Gunakan skrip setup yang menginstall `uv`, membuat
+`.venv`, dan menyiapkan dependensi sesuai mesin.
+
+Windows PowerShell:
+
+```powershell
+./scripts/setup.ps1            # default: GPU NVIDIA
+./scripts/setup.ps1 -CPU       # ONNX Runtime CPU
+./scripts/setup.ps1 -DML       # ONNX Runtime DirectML
+```
+
+Linux/macOS:
+
+```bash
+./scripts/setup.sh             # default: NVIDIA GPU
+./scripts/setup.sh -CPU
+./scripts/setup.sh -DML
+```
+
+Tanpa skrip, aktifkan `.venv` dan pakai `uv pip install -r requirements/...`
+sesuai pilihan GPU/CPU/DML.
+
+## Menjalankan
+
+```bash
+python main.py                 # menu interaktif: Tello / video / webcam / diagnosa
+python main.py tello            # langsung mode Tello
+python main.py video            # pilih video dari folder videos/
+python main.py webcam
+python main.py diagnose         # cek CUDA/DML/CPU + aset wajah
+```
+
+Mode Tello — tombol:
+
+```
+SPACE=naik/turun   WASD=gerak    T=takeoff    L=land
+Q=foto   E=rekam   C/X=kecepatan   []=trim   F=emergency   TAB=reset trim
+```
+
+Tello: takeoff via tombol `T`. Saat dijalankan langsung lewat
+`src/full_pipeline.py`, mode Tello butuh flag `--allow-takeoff` untuk
+mengizinkan takeoff; tanpa flag, hanya stream + kontrol tanpa terbang.
 
 ## Model yang dibutuhkan
 
-Letakkan file berikut di `models/`:
+Letakkan file di `models/`:
 
-```text
+```
 models/
-├── yolov8s.pt atau yolov8s.engine
-├── yolo26s-pose.pt atau yolo26s-pose.engine
+├── yolov8s_512_fp32.onnx          # detector
+├── yolo26s-pose_512_fp32.onnx     # pose
 ├── har_window_30_representative.onnx
 ├── feature_mean.npy
 ├── feature_std.npy
-└── class_mapping.json atau pipeline_metadata.json
+└── pipeline_metadata.json
 ```
 
-Notebook Kaggle menggunakan `yolov8s_512_fp32.onnx` dan
-`yolo26s-pose_512_fp32.onnx`. Lihat [models/README.md](models/README.md) untuk
-aturan Git LFS dan validasi bentuk model. Statistik normalisasi wajib berasal
-dari training model HAR yang sama.
+Lihat [models/README.md](models/README.md) untuk aturan Git LFS dan validasi
+bentuk model. Statistik normalisasi wajib berasal dari training model HAR yang
+sama.
 
-## Instalasi lokal
-
-Direkomendasikan menggunakan Python 3.11.
+## Diagnosa runtime
 
 ```bash
-python -m venv .venv
+python main.py diagnose
 ```
 
-Windows:
+Menampilkan versi OpenCV, Ultralytics, ONNX Runtime + provider (TensorRT/CUDA/
+DML/CPU), PyAV, PyTorch/CUDA, dan status aset wajah (model + jumlah identitas).
 
-```powershell
-.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements/requirements-full.txt
-```
-
-Linux:
+## Pengujian langsung
 
 ```bash
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements/requirements-full.txt
-```
-
-## Pengujian
-
-```bash
-python src/diagnose_runtime.py
-python src/full_pipeline.py --source video --video path/to/video.mp4 --profile quality
+python src/full_pipeline.py --source video --video path/to/video.mp4 --profile laptop
 python src/full_pipeline.py --source webcam --camera 0 --profile laptop
-python src/full_pipeline.py --source tello --profile nano
+python src/full_pipeline.py --source tello --profile nano --enable-face
 ```
-
-Mode wajah dan liveness:
-
-```bash
-python src/full_pipeline.py --source video --video path/to/video.mp4 --profile laptop --enable-face
-```
-
-Pada NVIDIA Jetson, gunakan versi PyTorch, TensorRT, dan ONNX Runtime yang
-kompatibel dengan JetPack; jangan memaksakan wheel CUDA desktop.
 
 ## Privasi dan keselamatan
 
 - Database embedding wajah tidak disimpan di repository publik.
 - Jangan commit foto wajah, embedding personal, token, atau credential Kaggle.
-- Mode Tello tidak melakukan takeoff otomatis tanpa opsi dan perintah pengguna.
-- Pengujian terbang harus dilakukan di area aman dengan baterai cukup dan
-  propeller guard.
+- Mode Tello tidak melakukan takeoff otomatis tanpa perintah pengguna tombol
+  dan flag `--allow-takeoff`.
+- Pengujian terbang dilakukan di area aman dengan baterai cukup dan propeller
+  guard.
 
 ## Status
 
-- Pipeline ONNX Kaggle: tersedia.
+- Pipeline ONNX penuh: tersedia.
 - Multi-person detection dan ByteTrack: tersedia.
 - Body110 + CNN-BiLSTM: tersedia.
+- Kontrol DJI Tello (keyboard + gamepad, HUD, foto/rekaman): tersedia.
 - Face recognition dan liveness: tersedia sebagai modul opsional.
 - Model binary: disediakan terpisah melalui Kaggle/Git LFS karena ukuran dan
   lisensinya.
-

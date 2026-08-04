@@ -1,0 +1,6 @@
+onnxruntime-gpu==1.20.2
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-nvjitlink-cu12

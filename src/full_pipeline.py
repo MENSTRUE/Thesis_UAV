@@ -44,14 +44,14 @@ except ImportError:
 
 try:
     from tello_control import (BATTERY_CRITICAL, TRIM_MAX, TRIM_STEP,
-                               DroneControl, InputHandler, SPEED_MODES,
-                               VideoHandler, load_config, rc_from_state,
-                               save_config)
+                               DroneControl, H264Mp4Writer, InputHandler,
+                               SPEED_MODES, VideoHandler, load_config,
+                               rc_from_state, save_config)
 except ImportError:
     from src.tello_control import (BATTERY_CRITICAL, TRIM_MAX, TRIM_STEP,
-                                   DroneControl, InputHandler, SPEED_MODES,
-                                   VideoHandler, load_config, rc_from_state,
-                                   save_config)
+                                   DroneControl, H264Mp4Writer, InputHandler,
+                                   SPEED_MODES, VideoHandler, load_config,
+                                   rc_from_state, save_config)
 
 
 SEQUENCE_LENGTH = 30
@@ -286,12 +286,17 @@ class DroneControlSource:
 
     def overlay(self, frame):
         lr, fb, ud, yaw = self._last_rc
-        return self.video.render(
+        frame = self.video.render(
             frame, self.control.get_battery(), self.control.is_flying,
             self.inputs.mode, self.video.recording, self.trim_lr,
             SPEED_MODES[self.speed_idx], self.show_grid,
             lr=lr, fb=fb, ud=ud, yaw=yaw,
         )
+        # write_frame tidak pernah dipanggil sebelumnya -> rekaman selalu
+        # menghasilkan MP4 kosong (258 byte). Rekam frame + HUD yang tampil.
+        if self.video.recording:
+            self.video.write_frame(frame)
+        return frame
 
 
 def make_source(args):
@@ -465,9 +470,9 @@ def main(argv: Optional[List[str]] = None):
                 continue
             h, w = frame.shape[:2]
             if writer is None and not args.no_save_video:
-                writer = cv2.VideoWriter(
-                    str(args.output), cv2.VideoWriter_fourcc(*"mp4v"),
-                    max(min(source.fps, 30.0), 1.0), (w, h),
+                writer = H264Mp4Writer(
+                    str(args.output), w, h,
+                    fps=float(max(min(source.fps, 30.0), 1.0)),
                 )
 
             if args.source == "tello":
@@ -579,7 +584,7 @@ def main(argv: Optional[List[str]] = None):
     finally:
         source.close()
         if writer is not None:
-            writer.release()
+            writer.close()
         cv2.destroyAllWindows()
 
     wall_time = max(time.perf_counter() - started_all, 1e-6)

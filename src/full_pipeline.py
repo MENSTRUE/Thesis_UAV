@@ -102,7 +102,8 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--mapping", type=Path, default=Path("models/pipeline_metadata.json"))
     parser.add_argument("--tracker", default="bytetrack.yaml")
     parser.add_argument("--device", default="auto", help="auto, cpu, 0, 1, ...")
-    parser.add_argument("--detector-conf", type=float, default=0.15)
+    parser.add_argument("--detector-conf", type=float, default=0.40)
+    # confidence nya naikin kalau bisa
     parser.add_argument("--pose-conf", type=float, default=0.05)
     parser.add_argument("--detector-imgsz", type=int)
     parser.add_argument("--pose-imgsz", type=int)

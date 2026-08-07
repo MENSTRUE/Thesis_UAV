@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import platform
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -1185,6 +1186,21 @@ def main(argv: Optional[List[str]] = None):
         )
         print("[OK] Manifest:", manifest_path.resolve())
         print("[OK] Reports :", reports_session_dir.resolve())
+
+        try:
+            import importlib.util as _ilu
+
+            export_script = Path(__file__).resolve().parents[1] / "scripts" / "export_pipeline.py"
+            spec = _ilu.spec_from_file_location("export_pipeline", export_script)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("export_pipeline.py tidak ditemukan")
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            summary_path = mod.build()
+            print("[OK] Summary :", summary_path.resolve())
+        except Exception as exc:
+            print(f"[!] Summary generator gagal: {exc}")
 
 
 if __name__ == "__main__":

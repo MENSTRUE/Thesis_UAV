@@ -620,8 +620,12 @@ f"{module_ms['face_liveness']:.1f}", f"{module_ms['total']:.1f}",
         s["n_frames"] += 1
         s["people_sum"] += n_people
         for key in self.MODULE_KEYS:
-            a["ms_samples"][key].append(float(module_ms[key]))
-            s["ms"].setdefault(key, []).append(float(module_ms[key]))
+            value = float(module_ms[key])
+            # Modul yang tidak dijalankan frame ini (pose/face interval,
+            # tanpa deteksi) menghasilkan 0.0; jangan cemari mean timing.
+            if value > 0:
+                a["ms_samples"][key].append(value)
+                s["ms"].setdefault(key, []).append(value)
 
     def close(self):
         self._det_file.close()
@@ -819,11 +823,13 @@ def main(argv: Optional[List[str]] = None):
         entry = {
             "segment_index": seg_index,
             "frames": agg.get("n_frames", 0),
+            "n_detections": agg.get("n_detections", 0),
             "duration_s": round(agg.get("end_t", 0) - agg.get("start_t", 0), 3)
             if agg.get("start_t") else 0,
             "throughput_fps": stat_row.get("throughput_fps", 0),
             "dominant_activity": stat_row.get("dominant_activity", ""),
             "accuracy_pct": stat_row.get("accuracy_pct", ""),
+            "detection_ok": bool(agg.get("n_detections", 0) > 0),
         }
         if segment_video_path is not None:
             entry["video"] = str(segment_video_path)
@@ -1168,9 +1174,14 @@ def main(argv: Optional[List[str]] = None):
         print("Report:", session_report_path.resolve())
 
     if segment_stat_rows:
+        warnings = [
+            f"Segmen {e['segment_index']}: tidak ada deteksi - "
+            f"cek video, detector-conf ({args.detector_conf}), atau provider ONNX"
+            for e in segment_entries if not e.get("detection_ok")
+        ]
         manifest_path = write_run_manifest(
             session_dir.name, session_dir.name, args, profile, mapping,
-            segment_entries, reported_files,
+            segment_entries, reported_files, warnings,
         )
         print("[OK] Manifest:", manifest_path.resolve())
         print("[OK] Reports :", reports_session_dir.resolve())

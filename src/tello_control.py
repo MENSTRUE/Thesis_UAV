@@ -23,6 +23,7 @@ from threading import Lock, Thread
 from typing import Tuple
 
 import cv2
+from fractions import Fraction
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +314,54 @@ class InputHandler:
 # VideoHandler: HUD + foto + rekaman — dari dji-tello/video_handler.py
 # ---------------------------------------------------------------------------
 
+class H264Mp4Writer:
+    """Writer MP4 H.264 via PyAV (libx264).
+
+    Pengganti cv2.VideoWriter mp4v (MPEG-4 Part 2) yang tidak bisa diputar di
+    banyak perangkat (Android/iPhone default player). H.264 + yuv420p adalah
+    format paling kompatibel; faststart menempatkan moov di awal file sehingga
+    tetap bisa dibuka meski proses dihentikan paksa.
+    """
+
+    def __init__(self, path: str, width: int, height: int, fps: float = 20.0):
+        import av
+
+        self._container = av.open(str(path), mode="w", options={"movflags": "faststart"})
+        self._stream = self._container.add_stream("h264", rate=Fraction(fps))
+        self._stream.width, self._stream.height = int(width), int(height)
+        self._stream.pix_fmt = "yuv420p"
+        self._stream.options = {"preset": "ultrafast", "tune": "zerolatency", "crf": "23"}
+        self._open = True
+        self._frame_count = 0
+
+    @property
+    def is_open(self):
+        return self._open
+
+    def write(self, frame):
+        if not self._open or frame is None:
+            return
+        import av
+
+        # ponytail: pts wajib diisi (unit = stream.time_base = 1/fps);
+        # tanpa pts PyAV menulis timestamp invalid -> MP4 tidak bisa diputar.
+        vframe = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        vframe.pts = self._frame_count
+        self._frame_count += 1
+        for packet in self._stream.encode(vframe):
+            self._container.mux(packet)
+
+    def close(self):
+        if not self._open:
+            return
+        import av
+
+        for packet in self._stream.encode():
+            self._container.mux(packet)
+        self._container.close()
+        self._open = False
+
+
 class VideoHandler:
     def __init__(self):
         os.makedirs(PHOTO_DIR, exist_ok=True)
@@ -412,21 +461,25 @@ class VideoHandler:
 
     def _start_recording(self, shape):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         h, w = shape[:2]
-        self._writer = cv2.VideoWriter(f"{VIDEO_DIR}/tello_{ts}.mp4", fourcc, 20.0, (w, h))
+        self._writer = H264Mp4Writer(f"{VIDEO_DIR}/tello_{ts}.mp4", w, h, fps=20.0)
         self._recording = True
         self._rec_start = time.time()
 
     def _stop_recording(self):
         if self._writer:
-            self._writer.release()
+            self._writer.close()
             self._writer = None
         self._recording = False
 
     def write_frame(self, frame):
         if self._writer:
             self._writer.write(frame)
+
+    def close(self):
+        """Finalize rekaman yang masih aktif (dipanggil saat keluar program)."""
+        if self._recording:
+            self._stop_recording()
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +612,8 @@ class DroneControl:
             pass
         from djitellopy import tello as _dt
         for sock in (getattr(_dt, "client_socket", None), getattr(_dt, "state_socket", None)):
+            if sock is None:
+                continue
             try:
                 sock.close()
             except Exception:

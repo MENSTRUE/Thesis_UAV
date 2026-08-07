@@ -128,6 +128,24 @@ python src/full_pipeline.py --source webcam --camera 0 --profile laptop
 python src/full_pipeline.py --source tello --profile nano --enable-face
 ```
 
+## Rekaman video dan log CSV
+
+- **Codec H.264** (PyAV/libx264, yuv420p + faststart) — kompatibel dengan
+  pemutar default Windows/Android/iPhone. OpenCV `mp4v` lama ditinggalkan
+  karena sering tidak bisa diputar.
+- Mode **Tello**: tekan `E` untuk mulai/berhenti rekaman. Video disimpan di
+  `captures/videos/tello_*.mp4` (frame + HUD). Rekaman yang masih aktif
+  difinalisasi otomatis saat program ditutup.
+- Mode **video/webcam**: video output ditulis ke `--output`.
+- Setiap eksekusi membuat folder `output/run_<timestamp>/` berisi:
+  - `detections.csv` — 1 baris per deteksi per frame: `frame_index,
+    t_run_s, track_id, x1, y1, x2, y2, det_conf, activity, activity_score,
+    pose_valid, face_identity, face_similarity, liveness, liveness_score`
+  - `frames.csv` — agregat per frame: `frame_index, t_run_s, n_people,
+    dominant_activity, fps_ema, ms_detector, ms_bytetrack, ms_pose,
+    ms_body110_har, ms_face_liveness, ms_total`
+  - `benchmark.json` (video/webcam) atau `session_benchmark.json` (Tello)
+
 ## Privasi dan keselamatan
 
 - Database embedding wajah tidak disimpan di repository publik.

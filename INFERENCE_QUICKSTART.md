@@ -122,8 +122,10 @@ Di Windows PowerShell, perintah satu barisnya:
 python src/full_pipeline.py --source video --video "videos/uji.mp4" --profile quality --mapping models/pipeline_metadata.json
 ```
 
-Hasil video disimpan secara default ke `output/full_pipeline.mp4`, sedangkan
-laporan performa disimpan ke `output/benchmark.json`.
+Hasil video dan laporan performa disimpan secara default ke folder baru
+`output/run_<timestamp>/` (`full_pipeline.mp4` + `benchmark.json`), ditambah
+log CSV `detections.csv` dan `frames.csv`. Setiap eksekusi membuat folder run
+baru agar hasil lama tidak tertimpa.
 
 Cara paling sederhana — menu interaktif (pilih video dari `videos/`):
 

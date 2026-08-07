@@ -332,6 +332,7 @@ class H264Mp4Writer:
         self._stream.pix_fmt = "yuv420p"
         self._stream.options = {"preset": "ultrafast", "tune": "zerolatency", "crf": "23"}
         self._open = True
+        self._frame_count = 0
 
     @property
     def is_open(self):
@@ -342,7 +343,11 @@ class H264Mp4Writer:
             return
         import av
 
+        # ponytail: pts wajib diisi (unit = stream.time_base = 1/fps);
+        # tanpa pts PyAV menulis timestamp invalid -> MP4 tidak bisa diputar.
         vframe = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        vframe.pts = self._frame_count
+        self._frame_count += 1
         for packet in self._stream.encode(vframe):
             self._container.mux(packet)
 
@@ -470,6 +475,11 @@ class VideoHandler:
     def write_frame(self, frame):
         if self._writer:
             self._writer.write(frame)
+
+    def close(self):
+        """Finalize rekaman yang masih aktif (dipanggil saat keluar program)."""
+        if self._recording:
+            self._stop_recording()
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +612,8 @@ class DroneControl:
             pass
         from djitellopy import tello as _dt
         for sock in (getattr(_dt, "client_socket", None), getattr(_dt, "state_socket", None)):
+            if sock is None:
+                continue
             try:
                 sock.close()
             except Exception:

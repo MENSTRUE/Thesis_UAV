@@ -1,7 +1,7 @@
 """Pipeline penuh HAR UAV off-board.
 
 Alur:
-Tello/video/webcam -> YOLO person + ByteTrack -> YOLO Pose -> Raw51 ->
+Tello/video/webcam -> YOLO person -> ByteTrack -> YOLO Pose -> Raw51 ->
 Body110 -> CNN-BiLSTM ONNX -> InsightFace -> MiniFASNetV2 -> overlay/report.
 
 Source ``tello`` kini memakai DroneControl dari dji-tello (PyAV low-latency,
@@ -38,9 +38,9 @@ except ImportError:
     from src.runtime_utils import resolve_ort_providers, setup_cuda_paths
 
 try:
-    from yolo_onnx import IoUTracker, YoloDetector, YoloPose
+    from yolo_onnx import ByteTrack, YoloDetector, YoloPose
 except ImportError:
-    from src.yolo_onnx import IoUTracker, YoloDetector, YoloPose
+    from src.yolo_onnx import ByteTrack, YoloDetector, YoloPose
 
 try:
     from tello_control import (BATTERY_CRITICAL, TRIM_MAX, TRIM_STEP,
@@ -102,7 +102,8 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--mapping", type=Path, default=Path("models/pipeline_metadata.json"))
     parser.add_argument("--tracker", default="bytetrack.yaml")
     parser.add_argument("--device", default="auto", help="auto, cpu, 0, 1, ...")
-    parser.add_argument("--detector-conf", type=float, default=0.15)
+    parser.add_argument("--detector-conf", type=float, default=0.40)
+    # confidence nya naikin kalau bisa
     parser.add_argument("--pose-conf", type=float, default=0.05)
     parser.add_argument("--detector-imgsz", type=int)
     parser.add_argument("--pose-imgsz", type=int)
@@ -116,13 +117,44 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--face-threshold", type=float, default=0.275,
                         help="cosine similarity (EER centroid = 0.275)")
     parser.add_argument("--liveness-threshold", type=float, default=0.6)
-    parser.add_argument("--output", type=Path, default=Path("output/full_pipeline.mp4"))
-    parser.add_argument("--report", type=Path, default=Path("output/benchmark.json"))
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Path video output. Jika kosong, dibuat otomatis per run.")
+    parser.add_argument("--report", type=Path, default=None,
+                        help="Path report JSON. Jika kosong, dibuat otomatis per run.")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--no-save-video", action="store_true")
     parser.add_argument("--allow-takeoff", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0, help="0 berarti sampai sumber habis")
     return parser.parse_args(argv)
+
+
+def resolve_output_paths(args):
+    """Buat output unik per eksekusi agar video/report lama tidak tertimpa."""
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    base_dir = Path("output") / f"run_{run_id}"
+
+    # Hindari tabrakan bila dua run dimulai pada detik yang sama.
+    suffix = 1
+    while base_dir.exists():
+        base_dir = Path("output") / f"run_{run_id}_{suffix:02d}"
+        suffix += 1
+
+    if args.output is None and args.report is None:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        args.output = base_dir / "full_pipeline.mp4"
+        args.report = base_dir / "benchmark.json"
+    elif args.output is None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.output = args.report.parent / "full_pipeline.mp4"
+    elif args.report is None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.report = args.output.parent / "benchmark.json"
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+
+    return args.output.parent.name
+
 
 
 def require_file(path: Path, label: str):
@@ -408,8 +440,74 @@ class ModuleTimer:
         return result
 
 
+def record_timing(main_timers, segment_timers, segment_active, name, seconds):
+    """Catat timing sesi penuh dan, bila aktif, rekaman yang sedang berjalan."""
+    main_timers.record(name, seconds)
+    if segment_active and segment_timers is not None:
+        segment_timers.record(name, seconds)
+
+
+def write_recording_report(
+    report_path,
+    video_path,
+    recording_index,
+    recording_frames,
+    recording_started,
+    profile,
+    tracker,
+    detector,
+    pose_model,
+    har_session,
+    face_system,
+    segment_timers,
+    args,
+):
+    """Simpan benchmark khusus satu segmen rekaman tanpa menghentikan pipeline."""
+    wall_time = max(time.perf_counter() - recording_started, 1e-6)
+
+    report = {
+        "recording_index": int(recording_index),
+        "video_output": str(video_path),
+        "architecture": "off-board",
+        "source": args.source,
+        "profile": args.profile,
+        "profile_values": profile.__dict__,
+        "tracker": {
+            "name": "ByteTrack",
+            "track_high_thresh": tracker.track_high_thresh,
+            "track_low_thresh": tracker.track_low_thresh,
+            "new_track_thresh": tracker.new_track_thresh,
+            "track_buffer": tracker.track_buffer,
+            "match_thresh": tracker.match_thresh,
+            "second_match_thresh": tracker.second_match_thresh,
+        },
+        "frames": int(recording_frames),
+        "wall_time_seconds": float(wall_time),
+        "throughput_fps": float(recording_frames / wall_time),
+        "yolo_ort": [detector.provider, pose_model.provider],
+        "onnx_providers": har_session.get_providers(),
+        "face_enabled": bool(face_system),
+        "platform": platform.platform(),
+        "module_timing": segment_timers.summary() if segment_timers is not None else {},
+        "warning": "FPS adalah hasil perangkat dan konfigurasi rekaman ini; bukan spesifikasi tetap model.",
+    }
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print()
+    print("=" * 72)
+    print(f"[REC STOP] Rekaman #{recording_index:03d} selesai")
+    print("Video :", video_path.resolve())
+    print("Report:", report_path.resolve())
+    print("=" * 72)
+
+
+
+
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
+    run_id = resolve_output_paths(args)
     setup_cuda_paths()
     profile = resolved_profile(args)
     for path, label in [
@@ -422,7 +520,14 @@ def main(argv: Optional[List[str]] = None):
     providers = resolve_ort_providers()
     detector = YoloDetector(str(args.detector), providers)
     pose_model = YoloPose(str(args.pose), providers)
-    tracker = IoUTracker()
+    tracker = ByteTrack(
+        track_high_thresh=args.detector_conf,
+        track_low_thresh=min(0.10, args.detector_conf),
+        new_track_thresh=args.detector_conf,
+        track_buffer=20,
+        match_thresh=0.80,
+        second_match_thresh=0.50,
+    )
     har_session = make_ort_session(args.har)
     mean = np.load(args.mean).astype(np.float32).reshape(-1)
     std = np.load(args.std).astype(np.float32).reshape(-1)
@@ -443,7 +548,17 @@ def main(argv: Optional[List[str]] = None):
     print("PROFILE    :", args.profile, profile)
     print("YOLO ORT   :", detector.provider, "/", pose_model.provider)
     print("HAR ORT    :", har_session.get_providers())
+    print("TRACKER    : ByteTrack | high=", tracker.track_high_thresh,
+          "| low=", tracker.track_low_thresh,
+          "| buffer=", tracker.track_buffer)
     print("FACE       :", "aktif" if face_system else "nonaktif")
+    print("RUN        :", run_id)
+    if args.source == "tello":
+        print("SESSION OUT:", session_dir)
+        print("RECORD     : tekan E = START/STOP; boleh berkali-kali tanpa restart")
+    else:
+        print("VIDEO OUT  :", args.output)
+        print("REPORT OUT :", args.report)
     print("=" * 72)
 
     raw_buffers = defaultdict(lambda: deque(maxlen=SEQUENCE_LENGTH))
@@ -453,11 +568,32 @@ def main(argv: Optional[List[str]] = None):
     last_seen, last_pose, last_prediction, last_face = {}, {}, {}, {}
     timers = ModuleTimer()
     writer = None
+
+    # --------------------------------------------------------------
+    # Multi-recording Tello:
+    # Program tetap hidup. Tekan E untuk mulai/berhenti rekaman.
+    # E berikutnya membuat video + benchmark baru tanpa restart.
+    # --------------------------------------------------------------
+    pipeline_recording = False
+    recording_index = 0
+    recording_frames = 0
+    recording_started = None
+    segment_timers = None
+    segment_video_path = None
+    segment_report_path = None
+
     frame_index = 0
     fps_ema = 0.0
     started_all = time.perf_counter()
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
+    session_dir = args.output.parent
+    session_report_path = (
+        session_dir / "session_benchmark.json"
+        if args.source == "tello"
+        else args.report
+    )
 
     try:
         while True:
@@ -469,34 +605,61 @@ def main(argv: Optional[List[str]] = None):
                 time.sleep(0.005)
                 continue
             h, w = frame.shape[:2]
-            if writer is None and not args.no_save_video:
-                writer = H264Mp4Writer(
-                    str(args.output), w, h,
-                    fps=float(max(min(source.fps, 30.0), 1.0)),
+            if args.source != "tello":
+                if writer is None and not args.no_save_video:
+                    writer = cv2.VideoWriter(
+                        str(args.output),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        max(min(source.fps, 30.0), 1.0),
+                        (w, h),
+                    )
+            elif pipeline_recording and writer is None and not args.no_save_video:
+                writer = cv2.VideoWriter(
+                    str(segment_video_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    max(min(source.fps, 30.0), 1.0),
+                    (w, h),
                 )
+                if not writer.isOpened():
+                    raise RuntimeError(
+                        f"Gagal membuat video rekaman: {segment_video_path}"
+                    )
 
             if args.source == "tello":
                 source.drive()
                 source.battery_check()
 
+            # Detector dijalankan sampai confidence rendah yang dibutuhkan
+            # ByteTrack. Track baru tetap hanya dibuat pada detector_conf.
             tick = time.perf_counter()
             dets = detector.run(
-                frame, profile.detector_imgsz, args.detector_conf, 0.50,
+                frame,
+                profile.detector_imgsz,
+                tracker.detector_min_conf,
+                0.50,
                 profile.max_people,
             )
-            timers.record("detector_bytetrack", time.perf_counter() - tick)
+            record_timing(timers, segment_timers, pipeline_recording, "detector", time.perf_counter() - tick)
+
+            tick = time.perf_counter()
+            ids = tracker.update(dets)
+            record_timing(timers, segment_timers, pipeline_recording, "bytetrack", time.perf_counter() - tick)
 
             current_boxes = {}
-            detections = []
-            if dets:
-                ids = tracker.update([d[0] for d in dets])
-                detections = [(d[0], d[1], track_id) for d, track_id in zip(dets, ids)]
-                current_boxes = {int(track_id): box for box, _, track_id in detections}
+            detections = [
+                (det[0], det[1], int(track_id))
+                for det, track_id in zip(dets, ids)
+                if int(track_id) > 0
+            ]
+            current_boxes = {
+                int(track_id): box
+                for box, _, track_id in detections
+            }
 
             if face_system is not None and frame_index % profile.face_interval == 0:
                 tick = time.perf_counter()
                 last_face.update(face_system.process(frame, current_boxes))
-                timers.record("face_liveness", time.perf_counter() - tick)
+                record_timing(timers, segment_timers, pipeline_recording, "face_liveness", time.perf_counter() - tick)
 
             for box, det_conf, track_id in detections:
                 track_id = int(track_id)
@@ -507,7 +670,7 @@ def main(argv: Optional[List[str]] = None):
                         frame, box, pose_model, profile.pose_imgsz,
                         args.pose_conf,
                     )
-                    timers.record("pose", time.perf_counter() - tick)
+                    record_timing(timers, segment_timers, pipeline_recording, "pose", time.perf_counter() - tick)
                     last_pose[track_id] = raw51
                 else:
                     # Zero-order hold untuk profil hemat.
@@ -524,7 +687,7 @@ def main(argv: Optional[List[str]] = None):
                         har_session, np.asarray(raw_buffers[track_id]),
                         np.asarray(mask_buffers[track_id]), mean, std,
                     )
-                    timers.record("body110_har", time.perf_counter() - tick)
+                    record_timing(timers, segment_timers, pipeline_recording, "body110_har", time.perf_counter() - tick)
                     probability_history[track_id].append(probability)
                     smooth = np.mean(probability_history[track_id], axis=0)
                     class_id = int(np.argmax(smooth))
@@ -552,7 +715,7 @@ def main(argv: Optional[List[str]] = None):
                     face_system.forget_track(track_id)
 
             elapsed = max(time.perf_counter() - frame_started, 1e-6)
-            timers.record("total_frame", elapsed)
+            record_timing(timers, segment_timers, pipeline_recording, "total_frame", elapsed)
             fps = 1.0 / elapsed
             fps_ema = fps if fps_ema == 0 else 0.9 * fps_ema + 0.1 * fps
             text_y = 74 if args.source == "tello" else 28
@@ -564,10 +727,73 @@ def main(argv: Optional[List[str]] = None):
                 frame = source.overlay(frame)
             if writer is not None:
                 writer.write(frame)
+                if args.source == "tello" and pipeline_recording:
+                    recording_frames += 1
             if not args.no_display:
                 cv2.imshow("Full Off-board HAR UAV", frame)
             key = cv2.waitKey(1) & 0xFF
             if args.source == "tello":
+                # --------------------------------------------------
+                # E dapat ditekan berkali-kali dalam SATU kali run:
+                # E #1 -> mulai recording_001
+                # E #2 -> stop + simpan benchmark_001
+                # E #3 -> mulai recording_002
+                # E #4 -> stop + simpan benchmark_002
+                # dst.
+                # --------------------------------------------------
+                if key in (ord("e"), ord("E")):
+                    if not pipeline_recording:
+                        recording_index += 1
+                        pipeline_recording = True
+                        recording_frames = 0
+                        recording_started = time.perf_counter()
+                        segment_timers = ModuleTimer()
+
+                        segment_video_path = (
+                            session_dir
+                            / f"recording_{recording_index:03d}.mp4"
+                        )
+                        segment_report_path = (
+                            session_dir
+                            / f"benchmark_{recording_index:03d}.json"
+                        )
+
+                        print()
+                        print("=" * 72)
+                        print(f"[REC START] Rekaman #{recording_index:03d}")
+                        print("Video :", segment_video_path.resolve())
+                        print("Report:", segment_report_path.resolve())
+                        print("Tekan E lagi untuk STOP dan menyimpan rekaman ini.")
+                        print("=" * 72)
+                    else:
+                        pipeline_recording = False
+
+                        if writer is not None:
+                            writer.release()
+                            writer = None
+
+                        write_recording_report(
+                            segment_report_path,
+                            segment_video_path,
+                            recording_index,
+                            recording_frames,
+                            recording_started,
+                            profile,
+                            tracker,
+                            detector,
+                            pose_model,
+                            har_session,
+                            face_system,
+                            segment_timers,
+                            args,
+                        )
+
+                        recording_started = None
+                        segment_timers = None
+                        segment_video_path = None
+                        segment_report_path = None
+                        recording_frames = 0
+
                 quit_now = source.process_control(key, frame)
                 if quit_now:
                     break
@@ -587,12 +813,50 @@ def main(argv: Optional[List[str]] = None):
             writer.close()
         cv2.destroyAllWindows()
 
+    # Jika Q/ESC/KeyboardInterrupt terjadi saat rekaman masih aktif,
+    # simpan report segmen terakhir agar tidak hilang.
+    if (
+        args.source == "tello"
+        and recording_started is not None
+        and segment_report_path is not None
+        and segment_video_path is not None
+    ):
+        write_recording_report(
+            segment_report_path,
+            segment_video_path,
+            recording_index,
+            recording_frames,
+            recording_started,
+            profile,
+            tracker,
+            detector,
+            pose_model,
+            har_session,
+            face_system,
+            segment_timers,
+            args,
+        )
+        pipeline_recording = False
+        recording_started = None
+
     wall_time = max(time.perf_counter() - started_all, 1e-6)
     report = {
+        "run_id": run_id,
+        "video_output": str(args.output),
+        "report_output": str(args.report),
         "architecture": "off-board",
         "source": args.source,
         "profile": args.profile,
         "profile_values": profile.__dict__,
+        "tracker": {
+            "name": "ByteTrack",
+            "track_high_thresh": tracker.track_high_thresh,
+            "track_low_thresh": tracker.track_low_thresh,
+            "new_track_thresh": tracker.new_track_thresh,
+            "track_buffer": tracker.track_buffer,
+            "match_thresh": tracker.match_thresh,
+            "second_match_thresh": tracker.second_match_thresh,
+        },
         "frames": frame_index,
         "wall_time_seconds": wall_time,
         "throughput_fps": frame_index / wall_time,
@@ -603,11 +867,16 @@ def main(argv: Optional[List[str]] = None):
         "module_timing": timers.summary(),
         "warning": "FPS adalah hasil perangkat dan konfigurasi ini; bukan spesifikasi tetap model.",
     }
-    args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    session_report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
-    if writer is not None:
-        print("Video :", args.output.resolve())
-    print("Report:", args.report.resolve())
+    if args.source == "tello":
+        print("Session folder:", session_dir.resolve())
+        print("Session report:", session_report_path.resolve())
+        print(f"Total rekaman : {recording_index}")
+    else:
+        if writer is not None:
+            print("Video :", args.output.resolve())
+        print("Report:", session_report_path.resolve())
 
 
 if __name__ == "__main__":

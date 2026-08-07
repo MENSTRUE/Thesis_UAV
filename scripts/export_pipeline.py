@@ -1,14 +1,14 @@
-"""Rebuild workbook summary report dari reports/ (adaptasi
-scripts/export_summary.py pada project drone_e99_face_recognition).
+"""Workbook summary eksperimen (adaptasi scripts/export_summary.py pada
+project drone_e99_face_recognition).
 
-Membaca:
-- reports/runs/manifest_*.json        -> sheet Experiments (1 baris per run)
-- reports/sessions/**/segment_stats_*.csv, activity_stats_*, identity_stats_*,
-  accuracy_*, confusion_*, per_second_*.csv -> sheet tabel.
+Satu file Excel, 1 baris per session/run: `reports/summary/summary_pipeline.xlsx`.
 
-Baris run lama dipertahankan (tidak ditimpa) saat regenerate.
+Membaca hanya `reports/runs/manifest_*.json` (satu folder) sehingga tidak perlu
+mencari-cari file di seluruh `reports/sessions/**`. Detail mentah tetap di CSV
+per-session (`reports/sessions/<session_id>/...`) dan tidak digabung di sini.
+
+Baris session lama dipertahankan (tidak ditimpa) saat regenerate.
 """
-import csv
 import json
 import sys
 from glob import glob
@@ -22,24 +22,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 RUNS_DIR = ROOT / "reports" / "runs"
-SESSIONS_DIR = ROOT / "reports" / "sessions"
 OUT = ROOT / "reports" / "summary" / "summary_pipeline.xlsx"
 
 EXPERIMENT_HEADERS = [
     "timestamp", "session_id", "source", "profile", "n_segments",
-    "n_frames", "throughput_fps", "labels",
+    "n_frames", "duration_s", "throughput_fps", "dominant_activity",
+    "accuracy_pct", "detection_ok", "labels",
     "detector_conf", "pose_conf", "pose_interval", "face_interval",
     "max_people", "face_enabled", "face_threshold", "liveness_threshold",
     "git_commit", "manifest",
-]
-
-STATS_SHEETS = [
-    ("SegmentStats", "segment_stats_*.csv"),
-    ("PerActivity", "activity_stats_*.csv"),
-    ("PerIdentity", "identity_stats_*.csv"),
-    ("Accuracy", "accuracy_*.csv"),
-    ("ConfusionMatrix", "confusion_*.csv"),
-    ("PerSecond", "per_second_*.csv"),
 ]
 
 
@@ -61,50 +52,29 @@ def load_manifests():
     return out
 
 
-def merge_csv(pattern):
-    """Gabung semua CSV yang cocok jadi list dict, tambahkan session_id."""
-    rows = []
-    for path in sorted(glob(pattern)):
-        session = Path(path).parent.name
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                row = {k: (v if v != "" else None) for k, v in row.items()}
-                rows.append({"session_id": session, **row})
-    return rows
-
-
-def write_table(wb, title, headers, rows, best_cols=None):
-    ws = wb.create_sheet(title)
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="D9E1F2")
-    for r, row in enumerate(rows, 2):
-        for c, h in enumerate(headers):
-            ws.cell(row=r, column=c + 1, value=row.get(h))
-    if best_cols:
-        for col, direction in best_cols.items():
-            if col not in headers:
-                continue
-            ci = headers.index(col) + 1
-            vals = [ws.cell(row=r, column=ci).value for r in range(2, len(rows) + 2)]
-            vals = [v for v in vals if isinstance(v, (int, float))]
-            if not vals:
-                continue
-            target = max(vals) if direction == "max" else min(vals)
-            fill = PatternFill("solid", fgColor="C6EFCE")
-            for r in range(2, len(rows) + 2):
-                if ws.cell(row=r, column=ci).value == target:
-                    ws.cell(row=r, column=ci).fill = fill
-    for c in range(1, len(headers) + 1):
-        width = len(str(headers[c - 1]))
-        for r in range(2, len(rows) + 2):
-            val = ws.cell(row=r, column=c).value
-            if val is not None:
-                width = max(width, len(str(val)))
-        ws.column_dimensions[get_column_letter(c)].width = min(width + 2, 40)
-    ws.freeze_panes = "A2"
-    return ws
+def _aggregate(segments):
+    """Ringkasan 1 baris dari daftar segmen manifest."""
+    if not segments:
+        return {
+            "n_segments": 0, "n_frames": 0, "duration_s": 0.0,
+            "throughput_fps": None, "dominant_activity": "",
+            "accuracy_pct": None, "detection_ok": False,
+        }
+    n_frames = sum(s.get("frames", 0) for s in segments)
+    duration = sum(s.get("duration_s", 0) for s in segments)
+    fps_vals = [s["throughput_fps"] for s in segments if s.get("throughput_fps")]
+    acc_vals = [s["accuracy_pct"] for s in segments
+                if isinstance(s.get("accuracy_pct"), (int, float))]
+    longest = max(segments, key=lambda s: s.get("duration_s", 0))
+    return {
+        "n_segments": len(segments),
+        "n_frames": n_frames,
+        "duration_s": round(duration, 2),
+        "throughput_fps": round(sum(fps_vals) / len(fps_vals), 2) if fps_vals else None,
+        "dominant_activity": longest.get("dominant_activity", ""),
+        "accuracy_pct": round(sum(acc_vals) / len(acc_vals), 2) if acc_vals else None,
+        "detection_ok": all(s.get("detection_ok") for s in segments),
+    }
 
 
 def experiment_rows(manifests):
@@ -112,17 +82,13 @@ def experiment_rows(manifests):
     for m in manifests:
         cfg = m.get("config", {})
         env = m.get("env", {})
-        segments = m.get("segments", [])
-        n_frames = sum(s.get("frames", 0) for s in segments)
-        fps_vals = [s.get("throughput_fps") for s in segments if s.get("throughput_fps")]
+        agg = _aggregate(m.get("segments", []))
         rows.append({
             "timestamp": m.get("timestamp"),
             "session_id": m.get("session_id"),
             "source": m.get("source"),
             "profile": m.get("profile"),
-            "n_segments": len(segments),
-            "n_frames": n_frames,
-            "throughput_fps": round(sum(fps_vals) / len(fps_vals), 2) if fps_vals else None,
+            **agg,
             "labels": m.get("labels"),
             "detector_conf": cfg.get("detector_conf"),
             "pose_conf": cfg.get("pose_conf"),
@@ -136,6 +102,35 @@ def experiment_rows(manifests):
             "manifest": m.get("run_id"),
         })
     return rows
+
+
+def write_table(wb, title, rows):
+    ws = wb.create_sheet(title)
+    for c, h in enumerate(EXPERIMENT_HEADERS, 1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+    for r, row in enumerate(rows, 2):
+        for c, h in enumerate(EXPERIMENT_HEADERS):
+            ws.cell(row=r, column=c + 1, value=row.get(h))
+    ci = EXPERIMENT_HEADERS.index("throughput_fps") + 1
+    vals = [ws.cell(row=r, column=ci).value for r in range(2, len(rows) + 2)]
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if vals:
+        best = max(vals)
+        fill = PatternFill("solid", fgColor="C6EFCE")
+        for r in range(2, len(rows) + 2):
+            if ws.cell(row=r, column=ci).value == best:
+                ws.cell(row=r, column=ci).fill = fill
+    for c in range(1, len(EXPERIMENT_HEADERS) + 1):
+        width = len(str(EXPERIMENT_HEADERS[c - 1]))
+        for r in range(2, len(rows) + 2):
+            val = ws.cell(row=r, column=c).value
+            if val is not None:
+                width = max(width, len(str(val)))
+        ws.column_dimensions[get_column_letter(c)].width = min(width + 2, 40)
+    ws.freeze_panes = "A2"
+    return ws
 
 
 def _load_existing_log():
@@ -177,26 +172,13 @@ def build():
     default = wb.active
     if default is not None:
         wb.remove(default)
-
-    write_table(wb, "ExperimentLog", EXPERIMENT_HEADERS, exp_rows,
-                best_cols={"throughput_fps": "max"})
-
-    for sheet, pattern in STATS_SHEETS:
-        rows = merge_csv(str(SESSIONS_DIR / "**" / pattern))
-        if not rows and sheet not in ("SegmentStats",):
-            continue
-        if rows:
-            headers = list(rows[0].keys())
-            write_table(wb, sheet, headers, rows)
+    write_table(wb, "ExperimentLog", exp_rows)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     wb.save(OUT)
     print(f"[OK] {OUT} ({len(manifests)} run, {len(exp_rows)} baris experiment log)")
-
-
-def main():
-    build()
+    return OUT
 
 
 if __name__ == "__main__":
-    main()
+    build()

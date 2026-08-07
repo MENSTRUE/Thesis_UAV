@@ -42,6 +42,23 @@ except ImportError:
     from src.yolo_onnx import ByteTrack, YoloDetector, YoloPose
 
 try:
+    from full_reporting import (ACCURACY_COLUMNS, ACTIVITY_COLUMNS,
+                                CONFUSION_COLUMNS, IDENTITY_COLUMNS,
+                                SECOND_COLUMNS, SEGMENT_STATS_COLUMNS,
+                                build_activity_rows, build_identity_rows,
+                                build_second_rows, build_segment_stats_row,
+                                compute_accuracy, load_ground_truth,
+                                write_rows_csv, write_run_manifest)
+except ImportError:
+    from src.full_reporting import (ACCURACY_COLUMNS, ACTIVITY_COLUMNS,
+                                    CONFUSION_COLUMNS, IDENTITY_COLUMNS,
+                                    SECOND_COLUMNS, SEGMENT_STATS_COLUMNS,
+                                    build_activity_rows, build_identity_rows,
+                                    build_second_rows, build_segment_stats_row,
+                                    compute_accuracy, load_ground_truth,
+                                    write_rows_csv, write_run_manifest)
+
+try:
     from tello_control import (BATTERY_CRITICAL, TRIM_MAX, TRIM_STEP,
                                DroneControl, H264Mp4Writer, InputHandler,
                                SPEED_MODES, VideoHandler, load_config,
@@ -134,6 +151,9 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--no-save-video", action="store_true")
     parser.add_argument("--allow-takeoff", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0, help="0 berarti sampai sumber habis")
+    parser.add_argument("--labels", type=Path, default=None,
+                        help="CSV ground truth per detik (second,activity[,segment_index]) "
+                             "untuk akurasi + confusion matrix per segmen.")
     return parser.parse_args(argv)
 
 
@@ -474,6 +494,8 @@ class CsvLogger:
     """Log deteksi per track (detections.csv) + agregat per frame (frames.csv).
 
     Ditulis streaming per frame dan difinalisasi saat program berhenti.
+    Sekaligus mengumpulkan agregat per segmen (dict `agg`) untuk laporan
+    per detik/pr segmen/per aktivitas/per identitas (full_reporting.py).
     """
 
     DETECTION_COLUMNS = [
@@ -486,6 +508,8 @@ class CsvLogger:
         "fps_ema", "ms_detector", "ms_bytetrack", "ms_pose",
         "ms_body110_har", "ms_face_liveness", "ms_total",
     ]
+    MODULE_KEYS = ["detector", "bytetrack", "pose", "body110_har",
+                   "face_liveness", "total"]
 
     def __init__(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
@@ -495,8 +519,32 @@ class CsvLogger:
         self._frame_file = open(directory / "frames.csv", "w", newline="", encoding="utf-8")
         self._frame_writer = csv.writer(self._frame_file)
         self._frame_writer.writerow(self.FRAME_COLUMNS)
+        self.agg = None
 
-    def detection(self, frame_index, t_run_s, track_id, box, det_conf,
+    def begin_segment(self, segment_index: int = 1):
+        self.agg = {
+            "segment_index": segment_index,
+            "start_t": None, "end_t": None,
+            "n_frames": 0, "people_sum": 0, "people_max": 0,
+            "fps_samples": [],
+            "seconds": {},
+            "activity": {},            # {nama: count}
+            "activities": {},          # {nama: (count, score_sum, [scores])}
+            "faces": {},               # {nama: count}
+            "liveness": {"real": 0, "spoof": 0, "unknown": 0},
+            "identity_sims": {},       # {nama: [similarities]}
+            "pose_valid": 0, "pose_total": 0,
+            "n_detections": 0,
+            "ms_samples": {m: [] for m in self.MODULE_KEYS},
+            "first_t": {}, "last_t": {},
+        }
+
+    def end_segment(self) -> dict:
+        agg = self.agg
+        self.agg = None
+        return agg if agg is not None else {}
+
+    def detection(self, frame_index, t_sec, track_id, box, det_conf,
                   activity, activity_score, pose_valid, face):
         x1, y1, x2, y2 = map(int, box)
         if face is None:
@@ -505,20 +553,75 @@ class CsvLogger:
             identity, similarity = face["identity"], f"{face['similarity']:.3f}"
             liveness, liveness_score = face["liveness"], f"{face['liveness_score']:.3f}"
         self._det_writer.writerow([
-            frame_index, f"{t_run_s:.3f}", track_id, x1, y1, x2, y2,
+            frame_index, f"{t_sec:.3f}", track_id, x1, y1, x2, y2,
             f"{float(det_conf):.3f}", activity, f"{float(activity_score):.3f}",
             pose_valid, identity, similarity, liveness, liveness_score,
         ])
+        if self.agg is None:
+            return
+        a = self.agg
+        if a["start_t"] is None:
+            a["start_t"] = t_sec
+        a["end_t"] = t_sec
+        a["n_detections"] += 1
+        a["activity"][activity] = a["activity"].get(activity, 0) + 1
+        acc = a["activities"].setdefault(activity, {"count": 0, "score_sum": 0.0, "scores": []})
+        acc["count"] += 1
+        acc["score_sum"] += float(activity_score)
+        acc["scores"].append(float(activity_score))
+        a["pose_valid"] += int(bool(pose_valid))
+        a["pose_total"] += 1
+        a["first_t"].setdefault(track_id, t_sec)
+        a["last_t"][track_id] = t_sec
 
-    def frame(self, frame_index, t_run_s, n_people, dominant_activity,
+        sec = int(t_sec)
+        s = a["seconds"].setdefault(sec, {
+            "n_frames": 0, "people_sum": 0, "n_detections": 0,
+            "activity": {}, "faces": {}, "ms": {},
+        })
+        s["n_detections"] += 1
+        s["activity"][activity] = s["activity"].get(activity, 0) + 1
+        if face is not None:
+            ident = face["identity"]
+            a["faces"][ident] = a["faces"].get(ident, 0) + 1
+            s["faces"][ident] = s["faces"].get(ident, 0) + 1
+            a["identity_sims"].setdefault(ident, []).append(float(face["similarity"]))
+            if face["liveness"] in a["liveness"]:
+                a["liveness"][face["liveness"]] += 1
+            else:
+                a["liveness"]["unknown"] += 1
+
+    def frame(self, frame_index, t_sec, n_people, dominant_activity,
               fps_ema, module_ms):
         self._frame_writer.writerow([
-            frame_index, f"{t_run_s:.3f}", n_people, dominant_activity,
+            frame_index, f"{t_sec:.3f}", n_people, dominant_activity,
             f"{fps_ema:.1f}",
             f"{module_ms['detector']:.1f}", f"{module_ms['bytetrack']:.1f}",
             f"{module_ms['pose']:.1f}", f"{module_ms['body110_har']:.1f}",
-            f"{module_ms['face_liveness']:.1f}", f"{module_ms['total']:.1f}",
+f"{module_ms['face_liveness']:.1f}", f"{module_ms['total']:.1f}",
         ])
+        if self.agg is None:
+            return
+        a = self.agg
+        if a["start_t"] is None:
+            a["start_t"] = t_sec
+        a["end_t"] = t_sec
+        a["n_frames"] += 1
+        a["people_sum"] += n_people
+        a["people_max"] = max(a["people_max"], n_people)
+        total_ms = float(module_ms["total"])
+        if total_ms > 0:
+            a["fps_samples"].append(1000.0 / total_ms)
+        sec = int(t_sec)
+        s = a["seconds"].setdefault(sec, {
+            "n_frames": 0, "people_sum": 0, "n_detections": 0,
+            "activity": {}, "faces": {}, "ms": {},
+        })
+        s["n_frames"] += 1
+        s["people_sum"] += n_people
+        for key in self.MODULE_KEYS:
+            a["ms_samples"][key].append(float(module_ms[key]))
+            s["ms"].setdefault(key, []).append(float(module_ms[key]))
 
     def close(self):
         self._det_file.close()
@@ -604,6 +707,9 @@ def main(argv: Optional[List[str]] = None):
     if mean.shape != (MODEL_FEATURE_DIM,) or std.shape != (MODEL_FEATURE_DIM,):
         raise ValueError(f"Scaler Body110 wajib (110,), ditemukan {mean.shape}/{std.shape}")
     mapping = load_mapping(args.mapping)
+    labels = load_ground_truth(args.labels)
+    if args.labels is not None:
+        require_file(args.labels, "ground truth labels")
     face_system = None
     if args.enable_face:
         from face_system import FaceSystem
@@ -669,6 +775,64 @@ def main(argv: Optional[List[str]] = None):
     segment_writer = None
     segment_video_path = None
     segment_report_path = None
+
+    # Laporan eksperimen (mirror reports/ project face-recognition):
+    # CSV per detik / per segmen / per aktivitas / per identitas + akurasi.
+    reports_session_dir = Path("reports") / "sessions" / session_dir.name
+    segment_stat_rows = []
+    activity_rows = []
+    identity_rows = []
+    accuracy_rows = []
+    confusion_rows = []
+    segment_entries = []
+    reported_files = []
+
+    def finalize_segment(seg_index, multi):
+        """Tutup agregat segmen, tulis CSV laporan, akumulasi baris agregat."""
+        agg = csv_logger.end_segment()
+        stat_row = build_segment_stats_row(agg, len(display_ids), labels)
+        segment_stat_rows.append(stat_row)
+        activity_rows.extend(build_activity_rows(agg))
+        identity_rows.extend(build_identity_rows(agg))
+        acc_rows, conf_rows, _, _ = compute_accuracy(agg, labels)
+        accuracy_rows.extend(acc_rows)
+        confusion_rows.extend(conf_rows)
+
+        suffix = f"_{seg_index:03d}" if multi else ""
+        per_second_path = reports_session_dir / f"per_second_{session_dir.name}{suffix}.csv"
+        write_rows_csv(per_second_path, build_second_rows(agg), SECOND_COLUMNS)
+        reported_files.append(str(per_second_path))
+
+        for rows, cols, kind in [
+            (segment_stat_rows, SEGMENT_STATS_COLUMNS, "segment_stats"),
+            (activity_rows, ACTIVITY_COLUMNS, "activity_stats"),
+            (identity_rows, IDENTITY_COLUMNS, "identity_stats"),
+            (accuracy_rows, ACCURACY_COLUMNS, "accuracy"),
+            (confusion_rows, CONFUSION_COLUMNS, "confusion"),
+        ]:
+            if not rows:
+                continue
+            path = reports_session_dir / f"{kind}_{session_dir.name}.csv"
+            write_rows_csv(path, rows, cols)
+            reported_files.append(str(path))
+
+        entry = {
+            "segment_index": seg_index,
+            "frames": agg.get("n_frames", 0),
+            "duration_s": round(agg.get("end_t", 0) - agg.get("start_t", 0), 3)
+            if agg.get("start_t") else 0,
+            "throughput_fps": stat_row.get("throughput_fps", 0),
+            "dominant_activity": stat_row.get("dominant_activity", ""),
+            "accuracy_pct": stat_row.get("accuracy_pct", ""),
+        }
+        if segment_video_path is not None:
+            entry["video"] = str(segment_video_path)
+            entry["report"] = str(segment_report_path)
+        segment_entries.append(entry)
+        return agg
+
+    if args.source != "tello":
+        csv_logger.begin_segment(1)
 
     try:
         while True:
@@ -886,6 +1050,7 @@ def main(argv: Optional[List[str]] = None):
                             str(segment_video_path), w, h,
                             fps=max(min(source.fps, 30.0), 1.0),
                         )
+                        csv_logger.begin_segment(recording_index)
 
                         print()
                         print("=" * 72)
@@ -915,6 +1080,7 @@ def main(argv: Optional[List[str]] = None):
                             segment_timers,
                             args,
                         )
+                        finalize_segment(recording_index, multi=True)
                         recording_started = None
                         segment_timers = None
                         segment_video_path = None
@@ -956,6 +1122,11 @@ def main(argv: Optional[List[str]] = None):
             detector, pose_model, har_session, face_system, segment_timers,
             args,
         )
+        finalize_segment(recording_index, multi=True)
+
+    # Non-Tello: seluruh run = satu segmen laporan.
+    if args.source != "tello" and csv_logger.agg is not None:
+        finalize_segment(1, multi=False)
 
     wall_time = max(time.perf_counter() - started_all, 1e-6)
     report = {
@@ -995,6 +1166,14 @@ def main(argv: Optional[List[str]] = None):
         if writer is not None:
             print("Video :", args.output.resolve())
         print("Report:", session_report_path.resolve())
+
+    if segment_stat_rows:
+        manifest_path = write_run_manifest(
+            session_dir.name, session_dir.name, args, profile, mapping,
+            segment_entries, reported_files,
+        )
+        print("[OK] Manifest:", manifest_path.resolve())
+        print("[OK] Reports :", reports_session_dir.resolve())
 
 
 if __name__ == "__main__":

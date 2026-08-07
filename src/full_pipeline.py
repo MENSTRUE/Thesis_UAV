@@ -67,6 +67,14 @@ SKELETON_EDGES = [
     (13, 15), (12, 14), (14, 16),
 ]
 
+DEFAULT_BOX_COLOR = (0, 220, 0)
+FACE_BOX_COLORS = {
+    ("spoof", False): (0, 0, 255),      # spoof + unknown -> merah
+    ("real", False): (0, 255, 255),     # real + unknown -> kuning
+    ("spoof", True): (0, 165, 255),     # spoof + enrolled -> oranye
+    ("real", True): DEFAULT_BOX_COLOR,  # real + enrolled -> hijau
+}
+
 
 @dataclass(frozen=True)
 class RuntimeProfile:
@@ -400,9 +408,9 @@ def draw_pose(frame, raw51):
             cv2.circle(frame, tuple(point), 3, (0, 80, 255), -1)
 
 
-def draw_box_and_text(frame, box, lines):
+def draw_box_and_text(frame, box, lines, color=DEFAULT_BOX_COLOR):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     y = max(18, y1 - 8)
     for line in reversed(lines):
         cv2.putText(frame, line, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
@@ -671,13 +679,19 @@ def main(argv: Optional[List[str]] = None):
                     f"T{track_id} | {activity} {activity_score:.2f} | det {float(det_conf):.2f}",
                     f"pose {int(sum(mask_buffers[track_id]))}/{len(mask_buffers[track_id])}",
                 ]
-                if track_id in last_face:
-                    face = last_face[track_id]
+                face = last_face.get(track_id)
+                if face is not None:
                     lines.append(
                         f"{face['identity']} {face['similarity']:.2f} | "
                         f"{face['liveness']} {face['liveness_score']:.2f}"
                     )
-                draw_box_and_text(frame, box, lines)
+                box_color = DEFAULT_BOX_COLOR
+                if face is not None:
+                    box_color = FACE_BOX_COLORS.get(
+                        (face["liveness"], face["identity"] != "unknown"),
+                        DEFAULT_BOX_COLOR,
+                    )
+                draw_box_and_text(frame, box, lines, box_color)
                 csv_logger.detection(
                     frame_index, time.perf_counter() - started_all,
                     track_id, box, det_conf, activity, activity_score,

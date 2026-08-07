@@ -44,7 +44,7 @@ SEGMENT_STATS_COLUMNS = [
 ]
 for col, _ in SEGMENT_MODULES:
     SEGMENT_STATS_COLUMNS += [f"{col}_mean", f"{col}_p95"]
-SEGMENT_STATS_COLUMNS += ["accuracy_pct", "n_labeled_seg"]
+SEGMENT_STATS_COLUMNS += ["accuracy_pct", "n_labeled_seg", "detection_ok"]
 
 ACTIVITY_COLUMNS = [
     "segment_index", "activity", "n_detections", "pct_time", "mean_score",
@@ -145,8 +145,10 @@ def build_second_rows(agg: dict) -> List[dict]:
         mod_pairs = [("ms_detector", "detector"), ("ms_bytetrack", "bytetrack"),
                      ("ms_pose", "pose"), ("ms_body110_har", "body110_har"),
                      ("ms_face_liveness", "face_liveness"), ("ms_total", "total")]
-        vals = {col: _r(np.mean(s["ms"].get(mod, [0])))
-                for col, mod in mod_pairs}
+        vals = {}
+        for col, mod in mod_pairs:
+            samples = s["ms"].get(mod)
+            vals[col] = _r(np.mean(samples)) if samples else ""
         fps = 1000.0 / vals["ms_total"] if vals["ms_total"] else 0.0
         rows.append({
             "segment_index": agg.get("segment_index", 1),
@@ -207,6 +209,7 @@ def build_segment_stats_row(agg: dict, n_tracks: int,
         "unknown": agg["liveness"].get("unknown", 0),
         "accuracy_pct": "",
         "n_labeled_seg": 0,
+        "detection_ok": 1 if agg.get("n_detections", 0) > 0 else 0,
     }
     for col, mod in SEGMENT_MODULES:
         samples = agg.get("ms_samples", {}).get(mod, [])
@@ -214,8 +217,8 @@ def build_segment_stats_row(agg: dict, n_tracks: int,
             row[f"{col}_mean"] = _r(np.mean(samples))
             row[f"{col}_p95"] = _r(np.percentile(samples, 95))
         else:
-            row[f"{col}_mean"] = 0
-            row[f"{col}_p95"] = 0
+            row[f"{col}_mean"] = ""
+            row[f"{col}_p95"] = ""
 
     if labels and agg.get("seconds"):
         _, _, accuracy, n_labeled = compute_accuracy(agg, labels)
@@ -313,7 +316,8 @@ def compute_accuracy(agg: dict, labels: Dict[Tuple[int, int], str]
 
 def write_run_manifest(run_id: str, session_id: str, args, profile,
                        mapping: Dict[int, str], segments: List[dict],
-                       files: List[str]) -> Path:
+                       files: List[str],
+                       warnings: Optional[List[str]] = None) -> Path:
     """Manifest run (mirror runlog.py): config + env + hasil ringkas."""
     data = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -345,6 +349,7 @@ def write_run_manifest(run_id: str, session_id: str, args, profile,
         "env": {**pkg_versions(), "git_commit": git_commit()},
         "segments": segments,
         "files": files,
+        "warnings": warnings or [],
     }
     path = Path("reports") / "runs" / f"manifest_{run_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)

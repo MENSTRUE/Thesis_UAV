@@ -168,18 +168,36 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--labels", type=Path, default=None,
                         help="CSV ground truth per detik (second,activity[,segment_index]) "
                              "untuk akurasi + confusion matrix per segmen.")
+
+    # Mode pengujian skripsi. Nilai 0 = mode biasa/manual.
+    parser.add_argument("--experiment-people", type=int, default=0,
+                        help="Aktifkan mode eksperimen UAV untuk skenario 1/2/3 orang.")
+    parser.add_argument("--experiment-repetitions", type=int, default=3,
+                        help="Jumlah pengulangan eksperimen (default 3).")
+    parser.add_argument("--experiment-warmup", type=float, default=5.0,
+                        help="Durasi warm-up sebelum timing dicatat (detik).")
+    parser.add_argument("--experiment-duration", type=float, default=30.0,
+                        help="Durasi measurement per pengulangan (detik).")
+    parser.add_argument("--experiment-activity", default="waving",
+                        help="Label rencana aktivitas untuk metadata eksperimen.")
+    parser.add_argument("--experiment-root", type=Path, default=Path("output/uav_final"),
+                        help="Root output khusus eksperimen UAV.")
     return parser.parse_args(argv)
 
 
 def resolve_output_paths(args):
-    """Buat output unik per eksekusi agar video/report lama tidak tertimpa."""
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    base_dir = Path("output") / f"run_{run_id}"
+    """Buat output unik dan, untuk eksperimen, pisahkan per jumlah manusia."""
+    run_stamp = time.strftime("%Y%m%d_%H%M%S")
+    if args.source == "tello" and int(getattr(args, "experiment_people", 0) or 0) > 0:
+        scenario = f"{int(args.experiment_people)}_orang"
+        base_dir = Path(args.experiment_root) / scenario / f"run_{run_stamp}"
+    else:
+        base_dir = Path("output") / f"run_{run_stamp}"
 
-    # Hindari tabrakan bila dua run dimulai pada detik yang sama.
     suffix = 1
+    original = base_dir
     while base_dir.exists():
-        base_dir = Path("output") / f"run_{run_id}_{suffix:02d}"
+        base_dir = original.parent / f"{original.name}_{suffix:02d}"
         suffix += 1
 
     if args.output is None and args.report is None:
@@ -195,9 +213,7 @@ def resolve_output_paths(args):
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
-
     return args.output.parent.name
-
 
 
 def require_file(path: Path, label: str):
@@ -517,23 +533,25 @@ def record_timing(timers, segment_timers, segment_active, name, seconds):
 
 
 class CsvLogger:
-    """Log deteksi per track (detections.csv) + agregat per frame (frames.csv).
+    """CSV sesi penuh + CSV khusus measurement setiap pengulangan.
 
-    Ditulis streaming per frame dan difinalisasi saat program berhenti.
-    Sekaligus mengumpulkan agregat per segmen (dict `agg`) untuk laporan
-    per detik/pr segmen/per aktivitas/per identitas (full_reporting.py).
+    Root ``detections.csv`` / ``frames.csv`` tetap menyimpan seluruh sesi agar
+    debugging mudah. Saat measurement aktif, baris yang sama juga disalin ke
+    ``rep_XX/detections.csv`` dan ``rep_XX/frames.csv``. Dengan demikian data
+    1/2/3 orang dan antar-pengulangan tidak perlu dipotong lagi berdasarkan timestamp.
     """
 
     DETECTION_COLUMNS = [
-        "frame_index", "t_run_s", "byte_track_id", "subject_id",
-        "x1", "y1", "x2", "y2",
+        "frame_index", "t_run_s", "segment_index", "phase", "t_segment_s",
+        "byte_track_id", "subject_id", "x1", "y1", "x2", "y2",
         "det_conf", "activity", "activity_score", "pose_valid",
         "face_identity", "face_similarity", "liveness", "liveness_score",
     ]
     FRAME_COLUMNS = [
-        "frame_index", "t_run_s", "n_people", "dominant_activity",
-        "fps_ema", "ms_detector", "ms_bytetrack", "ms_pose",
-        "ms_body110_har", "ms_face_liveness", "ms_total",
+        "frame_index", "t_run_s", "segment_index", "phase", "t_segment_s",
+        "n_people", "dominant_activity", "fps_ema", "ms_detector",
+        "ms_bytetrack", "ms_pose", "ms_body110_har", "ms_face_liveness",
+        "ms_total",
     ]
     MODULE_KEYS = ["detector", "bytetrack", "pose", "body110_har",
                    "face_liveness", "total"]
@@ -546,30 +564,74 @@ class CsvLogger:
         self._frame_file = open(directory / "frames.csv", "w", newline="", encoding="utf-8")
         self._frame_writer = csv.writer(self._frame_file)
         self._frame_writer.writerow(self.FRAME_COLUMNS)
-        self.agg = None
 
-    def begin_segment(self, segment_index: int = 1):
+        self._seg_det_file = None
+        self._seg_det_writer = None
+        self._seg_frame_file = None
+        self._seg_frame_writer = None
+        self.agg = None
+        self.segment_index = 0
+        self.phase = "idle"
+        self.t_segment_s = None
+
+    def set_context(self, segment_index=0, phase="idle", t_segment_s=None):
+        self.segment_index = int(segment_index or 0)
+        self.phase = str(phase or "idle")
+        self.t_segment_s = None if t_segment_s is None else float(t_segment_s)
+
+    def _close_segment_files(self):
+        for f in (self._seg_det_file, self._seg_frame_file):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+        self._seg_det_file = self._seg_frame_file = None
+        self._seg_det_writer = self._seg_frame_writer = None
+
+    def begin_segment(self, segment_index: int = 1, segment_dir: Optional[Path] = None,
+                      expected_people: int = 0, activity_plan: str = ""):
+        self._close_segment_files()
+        self.segment_index = int(segment_index)
+        self.phase = "measure"
+        self.t_segment_s = 0.0
         self.agg = {
-            "segment_index": segment_index,
+            "segment_index": int(segment_index),
+            "expected_people": int(expected_people or 0),
+            "activity_plan": str(activity_plan or ""),
             "start_t": None, "end_t": None,
             "n_frames": 0, "people_sum": 0, "people_max": 0,
+            "people_match_frames": 0,
             "fps_samples": [],
             "seconds": {},
-            "activity": {},            # {nama: count}
-            "activities": {},          # {nama: (count, score_sum, [scores])}
-            "faces": {},               # {nama: count}
+            "activity": {},
+            "activities": {},
+            "faces": {},
             "liveness": {"real": 0, "spoof": 0, "unknown": 0},
-            "identity_sims": {},       # {nama: [similarities]}
+            "identity_sims": {},
             "pose_valid": 0, "pose_total": 0,
             "n_detections": 0,
             "ms_samples": {m: [] for m in self.MODULE_KEYS},
             "first_t": {}, "last_t": {},
         }
+        if segment_dir is not None:
+            segment_dir.mkdir(parents=True, exist_ok=True)
+            self._seg_det_file = open(segment_dir / "detections.csv", "w", newline="", encoding="utf-8")
+            self._seg_det_writer = csv.writer(self._seg_det_file)
+            self._seg_det_writer.writerow(self.DETECTION_COLUMNS)
+            self._seg_frame_file = open(segment_dir / "frames.csv", "w", newline="", encoding="utf-8")
+            self._seg_frame_writer = csv.writer(self._seg_frame_file)
+            self._seg_frame_writer.writerow(self.FRAME_COLUMNS)
 
     def end_segment(self) -> dict:
         agg = self.agg
         self.agg = None
+        self._close_segment_files()
+        self.set_context(0, "idle", None)
         return agg if agg is not None else {}
+
+    def _segment_time(self, fallback):
+        return float(self.t_segment_s) if self.t_segment_s is not None else float(fallback)
 
     def detection(self, frame_index, t_sec, byte_track_id, subject_id, box,
                   det_conf, activity, activity_score, pose_valid, face):
@@ -579,18 +641,23 @@ class CsvLogger:
         else:
             identity, similarity = face["identity"], f"{face['similarity']:.3f}"
             liveness, liveness_score = face["liveness"], f"{face['liveness_score']:.3f}"
-        self._det_writer.writerow([
-            frame_index, f"{t_sec:.3f}", byte_track_id, subject_id,
-            x1, y1, x2, y2,
+        t_seg = self._segment_time(t_sec)
+        row = [
+            frame_index, f"{t_sec:.3f}", self.segment_index, self.phase, f"{t_seg:.3f}",
+            byte_track_id, subject_id, x1, y1, x2, y2,
             f"{float(det_conf):.3f}", activity, f"{float(activity_score):.3f}",
             pose_valid, identity, similarity, liveness, liveness_score,
-        ])
+        ]
+        self._det_writer.writerow(row)
+        if self._seg_det_writer is not None and self.agg is not None:
+            self._seg_det_writer.writerow(row)
+
         if self.agg is None:
             return
         a = self.agg
         if a["start_t"] is None:
-            a["start_t"] = t_sec
-        a["end_t"] = t_sec
+            a["start_t"] = t_seg
+        a["end_t"] = t_seg
         a["n_detections"] += 1
         a["activity"][activity] = a["activity"].get(activity, 0) + 1
         acc = a["activities"].setdefault(activity, {"count": 0, "score_sum": 0.0, "scores": []})
@@ -599,20 +666,20 @@ class CsvLogger:
         acc["scores"].append(float(activity_score))
         a["pose_valid"] += int(bool(pose_valid))
         a["pose_total"] += 1
-        a["first_t"].setdefault(subject_id, t_sec)
-        a["last_t"][subject_id] = t_sec
+        a["first_t"].setdefault(subject_id, t_seg)
+        a["last_t"][subject_id] = t_seg
 
-        sec = int(t_sec)
-        s = a["seconds"].setdefault(sec, {
+        sec = int(t_seg)
+        second = a["seconds"].setdefault(sec, {
             "n_frames": 0, "people_sum": 0, "n_detections": 0,
             "activity": {}, "faces": {}, "ms": {},
         })
-        s["n_detections"] += 1
-        s["activity"][activity] = s["activity"].get(activity, 0) + 1
+        second["n_detections"] += 1
+        second["activity"][activity] = second["activity"].get(activity, 0) + 1
         if face is not None:
             ident = face["identity"]
             a["faces"][ident] = a["faces"].get(ident, 0) + 1
-            s["faces"][ident] = s["faces"].get(ident, 0) + 1
+            second["faces"][ident] = second["faces"].get(ident, 0) + 1
             a["identity_sims"].setdefault(ident, []).append(float(face["similarity"]))
             if face["liveness"] in a["liveness"]:
                 a["liveness"][face["liveness"]] += 1
@@ -621,41 +688,49 @@ class CsvLogger:
 
     def frame(self, frame_index, t_sec, n_people, dominant_activity,
               fps_ema, module_ms):
-        self._frame_writer.writerow([
-            frame_index, f"{t_sec:.3f}", n_people, dominant_activity,
-            f"{fps_ema:.1f}",
+        t_seg = self._segment_time(t_sec)
+        row = [
+            frame_index, f"{t_sec:.3f}", self.segment_index, self.phase, f"{t_seg:.3f}",
+            n_people, dominant_activity, f"{fps_ema:.1f}",
             f"{module_ms['detector']:.1f}", f"{module_ms['bytetrack']:.1f}",
             f"{module_ms['pose']:.1f}", f"{module_ms['body110_har']:.1f}",
-f"{module_ms['face_liveness']:.1f}", f"{module_ms['total']:.1f}",
-        ])
+            f"{module_ms['face_liveness']:.1f}", f"{module_ms['total']:.1f}",
+        ]
+        self._frame_writer.writerow(row)
+        if self._seg_frame_writer is not None and self.agg is not None:
+            self._seg_frame_writer.writerow(row)
+
         if self.agg is None:
             return
         a = self.agg
         if a["start_t"] is None:
-            a["start_t"] = t_sec
-        a["end_t"] = t_sec
+            a["start_t"] = t_seg
+        a["end_t"] = t_seg
         a["n_frames"] += 1
         a["people_sum"] += n_people
         a["people_max"] = max(a["people_max"], n_people)
+        expected = int(a.get("expected_people", 0) or 0)
+        if expected and int(n_people) == expected:
+            a["people_match_frames"] += 1
         total_ms = float(module_ms["total"])
         if total_ms > 0:
             a["fps_samples"].append(1000.0 / total_ms)
-        sec = int(t_sec)
-        s = a["seconds"].setdefault(sec, {
+
+        sec = int(t_seg)
+        second = a["seconds"].setdefault(sec, {
             "n_frames": 0, "people_sum": 0, "n_detections": 0,
             "activity": {}, "faces": {}, "ms": {},
         })
-        s["n_frames"] += 1
-        s["people_sum"] += n_people
+        second["n_frames"] += 1
+        second["people_sum"] += n_people
         for key in self.MODULE_KEYS:
             value = float(module_ms[key])
-            # Modul yang tidak dijalankan frame ini (pose/face interval,
-            # tanpa deteksi) menghasilkan 0.0; jangan cemari mean timing.
             if value > 0:
                 a["ms_samples"][key].append(value)
-                s["ms"].setdefault(key, []).append(value)
+                second["ms"].setdefault(key, []).append(value)
 
     def close(self):
+        self._close_segment_files()
         self._det_file.close()
         self._frame_file.close()
 
@@ -673,13 +748,26 @@ def make_tracker(args):
 
 
 def write_recording_report(report_path, video_path, recording_index,
-                           recording_frames, recording_started, profile,
+                           recording_frames, recording_started, measurement_frames,
+                           measurement_started, measurement_ended, profile,
                            tracker, detector, pose_model, har_session,
-                           face_system, segment_timers, args):
-    """Benchmark JSON per segmen: 1 segmen = 1 percobaan eksperimen."""
-    wall_time = max(time.perf_counter() - recording_started, 1e-6)
+                           face_system, segment_timers, args, stop_reason="manual"):
+    """Benchmark JSON satu pengulangan.
+
+    Video mencakup warm-up + measurement. Statistik timing hanya berasal dari fase
+    measurement, sehingga perbandingan 1/2/3 orang tidak tercemar fase pengisian buffer.
+    """
+    now = time.perf_counter()
+    recording_wall = max(now - recording_started, 1e-6) if recording_started else 0.0
+    if measurement_started is not None:
+        end = measurement_ended if measurement_ended is not None else now
+        measurement_wall = max(end - measurement_started, 1e-6)
+    else:
+        measurement_wall = 0.0
+
+    experiment_enabled = bool(int(getattr(args, "experiment_people", 0) or 0))
     report = {
-        "run_kind": "tello_segment",
+        "run_kind": "tello_experiment_segment" if experiment_enabled else "tello_segment",
         "recording_index": recording_index,
         "video_output": str(video_path),
         "report_output": str(report_path),
@@ -687,6 +775,26 @@ def write_recording_report(report_path, video_path, recording_index,
         "source": "tello",
         "profile": args.profile,
         "profile_values": profile.__dict__,
+        "experiment": {
+            "enabled": experiment_enabled,
+            "expected_people": int(getattr(args, "experiment_people", 0) or 0),
+            "repetition": recording_index,
+            "target_repetitions": int(getattr(args, "experiment_repetitions", 0) or 0),
+            "warmup_seconds": float(getattr(args, "experiment_warmup", 0.0) or 0.0),
+            "target_measurement_seconds": float(getattr(args, "experiment_duration", 0.0) or 0.0),
+            "activity_plan": str(getattr(args, "experiment_activity", "") or ""),
+            "stop_reason": stop_reason,
+        },
+        "recording": {
+            "frames": int(recording_frames),
+            "wall_time_seconds": round(float(recording_wall), 6),
+        },
+        "measurement": {
+            "frames": int(measurement_frames),
+            "wall_time_seconds": round(float(measurement_wall), 6),
+            "throughput_fps": round(measurement_frames / measurement_wall, 3)
+            if measurement_wall > 0 else 0.0,
+        },
         "tracker": {
             "name": "ByteTrack",
             "track_high_thresh": tracker.track_high_thresh,
@@ -696,24 +804,20 @@ def write_recording_report(report_path, video_path, recording_index,
             "match_thresh": tracker.match_thresh,
             "second_match_thresh": tracker.second_match_thresh,
         },
-        "frames": recording_frames,
-        "wall_time_seconds": round(float(wall_time), 6),
-        "throughput_fps": round(recording_frames / wall_time, 3),
         "yolo_ort": [detector.provider, pose_model.provider],
         "onnx_providers": har_session.get_providers(),
         "face_enabled": bool(face_system),
         "platform": platform.platform(),
-        "module_timing": segment_timers.summary() if segment_timers is not None else {},
-        "warning": "FPS adalah hasil perangkat dan konfigurasi ini; bukan spesifikasi tetap model.",
+        "module_timing_measurement_only": segment_timers.summary() if segment_timers is not None else {},
+        "warning": "Timing eksperimen hanya fase measurement; warm-up tidak dimasukkan.",
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print()
     print("=" * 72)
-    print(f"[REC STOP] Segmen #{recording_index:03d} selesai.")
-    print("Video :", video_path.resolve())
-    print("Report:", report_path.resolve())
-    print(json.dumps(report, indent=2))
+    print(f"[SEGMENT STOP] Pengulangan #{recording_index:02d} selesai ({stop_reason}).")
+    print("Video  :", video_path.resolve())
+    print("Report :", report_path.resolve())
     print("=" * 72)
 
 
@@ -763,6 +867,20 @@ def main(argv: Optional[List[str]] = None):
         if args.source == "tello"
         else args.report
     )
+    experiment_enabled = bool(args.source == "tello" and int(args.experiment_people or 0) > 0)
+    if experiment_enabled:
+        experiment_config = {
+            "expected_people": int(args.experiment_people),
+            "repetitions": int(max(args.experiment_repetitions, 1)),
+            "warmup_seconds": float(max(args.experiment_warmup, 0.0)),
+            "measurement_seconds": float(max(args.experiment_duration, 1.0)),
+            "activity_plan": str(args.experiment_activity),
+            "face_enabled": bool(args.enable_face),
+            "note": "Model/threshold tetap; yang berubah antar skenario hanya jumlah manusia di area pengamatan.",
+        }
+        (session_dir / "experiment_config.json").write_text(
+            json.dumps(experiment_config, indent=2), encoding="utf-8"
+        )
 
     print("=" * 72)
     print("ARSITEKTUR : OFF-BOARD (Tello adalah kamera; komputasi di ground station)")
@@ -776,7 +894,13 @@ def main(argv: Optional[List[str]] = None):
     print("RUN        :", run_id)
     if args.source == "tello":
         print("SESSION OUT:", session_dir)
-        print("RECORD     : E = START/STOP segmen (recording_NNN.mp4 + benchmark_NNN.json)")
+        if experiment_enabled:
+            print(f"EXPERIMENT : {args.experiment_people} orang | {args.experiment_repetitions} pengulangan")
+            print(f"TIMING     : warm-up {args.experiment_warmup:.1f}s + measurement {args.experiment_duration:.1f}s")
+            print("ACTIVITY   :", args.experiment_activity)
+            print("CONTROL    : E = mulai pengulangan; STOP otomatis setelah measurement")
+        else:
+            print("RECORD     : E = START/STOP segmen manual")
         print("LOG CSV    :", (session_dir / "detections.csv").resolve())
     else:
         print("VIDEO OUT  :", args.output)
@@ -802,19 +926,29 @@ def main(argv: Optional[List[str]] = None):
     fps_ema = 0.0
     started_all = time.perf_counter()
 
-    # Rekaman multi-segmen Tello: E = START/STOP, tanpa restart program/Tello.
+    # State segmen Tello. pipeline_recording = video segmen aktif (warm-up+measure).
+    # measurement_active = statistik eksperimen sedang dicatat.
     pipeline_recording = False
+    measurement_active = False
+    experiment_phase = "idle"  # idle | warmup | measure
     recording_index = 0
     recording_frames = 0
+    measurement_frames = 0
     recording_started = None
+    measurement_started = None
+    measurement_ended = None
     segment_timers = None
     segment_writer = None
+    segment_dir = None
     segment_video_path = None
     segment_report_path = None
 
     # Laporan eksperimen (mirror reports/ project face-recognition):
     # CSV per detik / per segmen / per aktivitas / per identitas + akurasi.
-    reports_session_dir = Path("reports") / "sessions" / session_dir.name
+    reports_session_dir = Path("reports") / "sessions"
+    if experiment_enabled:
+        reports_session_dir = reports_session_dir / f"{int(args.experiment_people)}_orang"
+    reports_session_dir = reports_session_dir / session_dir.name
     segment_stat_rows = []
     activity_rows = []
     identity_rows = []
@@ -824,8 +958,10 @@ def main(argv: Optional[List[str]] = None):
     reported_files = []
 
     def finalize_segment(seg_index, multi):
-        """Tutup agregat segmen, tulis CSV laporan, akumulasi baris agregat."""
+        """Tutup agregat measurement, tulis CSV laporan, akumulasi hasil."""
         agg = csv_logger.end_segment()
+        if not agg:
+            return {}
         stat_row = build_segment_stats_row(agg, len(display_used), labels)
         segment_stat_rows.append(stat_row)
         activity_rows.extend(build_activity_rows(agg))
@@ -851,14 +987,21 @@ def main(argv: Optional[List[str]] = None):
             path = reports_session_dir / f"{kind}_{session_dir.name}.csv"
             write_rows_csv(path, rows, cols)
             reported_files.append(str(path))
+            if kind == "segment_stats":
+                local_summary = session_dir / "segment_stats.csv"
+                write_rows_csv(local_summary, rows, cols)
 
         entry = {
             "segment_index": seg_index,
+            "expected_people": agg.get("expected_people", 0),
+            "activity_plan": agg.get("activity_plan", ""),
             "frames": agg.get("n_frames", 0),
             "n_detections": agg.get("n_detections", 0),
             "duration_s": round(agg.get("end_t", 0) - agg.get("start_t", 0), 3)
-            if agg.get("start_t") else 0,
+            if agg.get("start_t") is not None else 0,
             "throughput_fps": stat_row.get("throughput_fps", 0),
+            "fps_mean": stat_row.get("fps_mean", 0),
+            "people_match_ratio_pct": stat_row.get("people_match_ratio_pct", ""),
             "dominant_activity": stat_row.get("dominant_activity", ""),
             "accuracy_pct": stat_row.get("accuracy_pct", ""),
             "detection_ok": bool(agg.get("n_detections", 0) > 0),
@@ -869,8 +1012,166 @@ def main(argv: Optional[List[str]] = None):
         segment_entries.append(entry)
         return agg
 
+    def reset_tracking_state():
+        """Reset state eksperimen tanpa mengubah model dan tanpa reconnect Tello."""
+        nonlocal tracker, next_display
+        old_tracks = set(last_seen) | set(last_face)
+        tracker = make_tracker(args)
+        display_used.clear()
+        next_display = 1
+        if reid is not None:
+            reid.reset()
+        for store in (raw_buffers, mask_buffers, probability_history):
+            store.clear()
+        samples_seen.clear()
+        last_seen.clear()
+        last_pose.clear()
+        last_prediction.clear()
+        last_face.clear()
+        if face_system is not None:
+            for tid in old_tracks:
+                face_system.forget_track(tid)
+
+    def start_tello_segment(width, height):
+        """Mulai satu pengulangan. Eksperimen: warm-up lalu measurement otomatis."""
+        nonlocal pipeline_recording, measurement_active, experiment_phase
+        nonlocal recording_index, recording_frames, measurement_frames
+        nonlocal recording_started, measurement_started, measurement_ended
+        nonlocal segment_timers, segment_writer, segment_dir
+        nonlocal segment_video_path, segment_report_path
+
+        if pipeline_recording:
+            return
+        if experiment_enabled and recording_index >= max(int(args.experiment_repetitions), 1):
+            print("[OK] Semua pengulangan eksperimen sudah selesai. Tekan ESC/Q untuk keluar.")
+            return
+
+        recording_index += 1
+        pipeline_recording = True
+        measurement_active = not experiment_enabled
+        experiment_phase = "warmup" if experiment_enabled else "measure"
+        recording_frames = 0
+        measurement_frames = 0
+        recording_started = time.perf_counter()
+        measurement_started = recording_started if measurement_active else None
+        measurement_ended = None
+        segment_timers = ModuleTimer() if measurement_active else None
+
+        if experiment_enabled:
+            segment_dir = session_dir / f"rep_{recording_index:02d}"
+            segment_video_path = segment_dir / "recording.mp4"
+            segment_report_path = segment_dir / "benchmark.json"
+        else:
+            segment_dir = session_dir / f"segment_{recording_index:03d}"
+            segment_video_path = segment_dir / "recording.mp4"
+            segment_report_path = segment_dir / "benchmark.json"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+
+        reset_tracking_state()
+        segment_writer = H264Mp4Writer(
+            str(segment_video_path), width, height,
+            fps=max(min(source.fps, 30.0), 1.0),
+        )
+
+        if measurement_active:
+            csv_logger.begin_segment(
+                recording_index, segment_dir=segment_dir,
+                expected_people=0, activity_plan="",
+            )
+            csv_logger.set_context(recording_index, "measure", 0.0)
+        else:
+            csv_logger.set_context(recording_index, "warmup", None)
+
+        print()
+        print("=" * 72)
+        if experiment_enabled:
+            print(f"[UJI START] {args.experiment_people} ORANG | REP {recording_index}/{args.experiment_repetitions}")
+            print(f"Warm-up {args.experiment_warmup:.1f}s -> measurement {args.experiment_duration:.1f}s -> STOP otomatis")
+            print("Aktivitas plan:", args.experiment_activity)
+        else:
+            print(f"[SEGMENT START] #{recording_index:03d} (manual; E untuk STOP)")
+        print("Video :", segment_video_path.resolve())
+        print("Folder:", segment_dir.resolve())
+        print("=" * 72)
+
+    def update_experiment_phase():
+        """Aktifkan measurement setelah warm-up. Dipanggil sebelum inferensi frame."""
+        nonlocal measurement_active, experiment_phase, measurement_started, segment_timers
+        if not (experiment_enabled and pipeline_recording):
+            return
+        if experiment_phase != "warmup":
+            return
+        now = time.perf_counter()
+        if now - recording_started < max(float(args.experiment_warmup), 0.0):
+            return
+
+        experiment_phase = "measure"
+        measurement_active = True
+        measurement_started = now
+        segment_timers = ModuleTimer()
+        csv_logger.begin_segment(
+            recording_index,
+            segment_dir=segment_dir,
+            expected_people=int(args.experiment_people),
+            activity_plan=str(args.experiment_activity),
+        )
+        csv_logger.set_context(recording_index, "measure", 0.0)
+        print(f"[MEASURE] REP {recording_index}/{args.experiment_repetitions} mulai - "
+              f"{args.experiment_duration:.1f} detik.")
+
+    def stop_tello_segment(reason="manual"):
+        """Stop video + finalisasi measurement/report tanpa menyentuh face implementation."""
+        nonlocal pipeline_recording, measurement_active, experiment_phase
+        nonlocal recording_frames, measurement_frames, recording_started
+        nonlocal measurement_started, measurement_ended, segment_timers
+        nonlocal segment_writer, segment_dir, segment_video_path, segment_report_path
+
+        if not pipeline_recording:
+            return
+        now = time.perf_counter()
+        if measurement_active:
+            measurement_ended = now
+        measurement_active = False
+        pipeline_recording = False
+        experiment_phase = "idle"
+
+        if segment_writer is not None:
+            segment_writer.close()
+            segment_writer = None
+
+        if csv_logger.agg is not None:
+            finalize_segment(recording_index, multi=True)
+        else:
+            csv_logger.set_context(0, "idle", None)
+
+        write_recording_report(
+            segment_report_path, segment_video_path, recording_index,
+            recording_frames, recording_started, measurement_frames,
+            measurement_started, measurement_ended, profile, tracker,
+            detector, pose_model, har_session, face_system, segment_timers,
+            args, stop_reason=reason,
+        )
+
+        if experiment_enabled:
+            done = recording_index >= max(int(args.experiment_repetitions), 1)
+            if done:
+                print("[OK] SKENARIO SELESAI. Semua pengulangan tersimpan di:")
+                print("    ", session_dir.resolve())
+            else:
+                print(f"[SIAP] Tekan E untuk pengulangan {recording_index + 1}/{args.experiment_repetitions}.")
+
+        recording_started = None
+        measurement_started = None
+        measurement_ended = None
+        segment_timers = None
+        segment_dir = None
+        segment_video_path = None
+        segment_report_path = None
+        recording_frames = 0
+        measurement_frames = 0
+
     if args.source != "tello":
-        csv_logger.begin_segment(1)
+        csv_logger.begin_segment(1, expected_people=0, activity_plan="")
 
     try:
         while True:
@@ -891,6 +1192,21 @@ def main(argv: Optional[List[str]] = None):
             if args.source == "tello":
                 source.drive()
                 source.battery_check()
+                update_experiment_phase()
+
+            # Context CSV dibuat eksplisit supaya setiap baris tahu berasal dari
+            # pengulangan/phase mana. Measurement time selalu dimulai dari 0.
+            now_context = time.perf_counter()
+            if args.source != "tello":
+                csv_logger.set_context(1, "measure", now_context - started_all)
+            elif measurement_active and measurement_started is not None:
+                csv_logger.set_context(
+                    recording_index, "measure", now_context - measurement_started
+                )
+            elif pipeline_recording:
+                csv_logger.set_context(recording_index, experiment_phase, None)
+            else:
+                csv_logger.set_context(0, "idle", None)
 
             # Detector dijalankan sampai confidence rendah yang dibutuhkan
             # ByteTrack. Track baru tetap hanya dibuat pada detector_conf.
@@ -902,11 +1218,11 @@ def main(argv: Optional[List[str]] = None):
                 0.50,
                 profile.max_people,
             )
-            ms_detector = record_timing(timers, segment_timers, pipeline_recording, "detector", time.perf_counter() - tick) * 1000.0
+            ms_detector = record_timing(timers, segment_timers, measurement_active, "detector", time.perf_counter() - tick) * 1000.0
 
             tick = time.perf_counter()
             ids = tracker.update(dets)
-            ms_bytetrack = record_timing(timers, segment_timers, pipeline_recording, "bytetrack", time.perf_counter() - tick) * 1000.0
+            ms_bytetrack = record_timing(timers, segment_timers, measurement_active, "bytetrack", time.perf_counter() - tick) * 1000.0
 
             current_boxes = {}
             detections = [
@@ -923,7 +1239,7 @@ def main(argv: Optional[List[str]] = None):
             if face_system is not None and frame_index % profile.face_interval == 0:
                 tick = time.perf_counter()
                 last_face.update(face_system.process(frame, current_boxes))
-                ms_face = record_timing(timers, segment_timers, pipeline_recording, "face_liveness", time.perf_counter() - tick) * 1000.0
+                ms_face = record_timing(timers, segment_timers, measurement_active, "face_liveness", time.perf_counter() - tick) * 1000.0
 
             # Re-ID ByteTrack -> subject_id stabil: track lama yang keluar-masuk
             # frame tetap dianggap subjek yang sama (embedding wajah).
@@ -969,7 +1285,7 @@ def main(argv: Optional[List[str]] = None):
                         frame, box, pose_model, profile.pose_imgsz,
                         args.pose_conf,
                     )
-                    ms_pose = record_timing(timers, segment_timers, pipeline_recording, "pose", time.perf_counter() - tick) * 1000.0
+                    ms_pose += record_timing(timers, segment_timers, measurement_active, "pose", time.perf_counter() - tick) * 1000.0
                     last_pose[track_id] = raw51
                 else:
                     # Zero-order hold untuk profil hemat.
@@ -988,7 +1304,7 @@ def main(argv: Optional[List[str]] = None):
                         har_session, np.asarray(raw_buffers[track_id]),
                         np.asarray(mask_buffers[track_id]), mean, std,
                     )
-                    ms_har = record_timing(timers, segment_timers, pipeline_recording, "body110_har", time.perf_counter() - tick) * 1000.0
+                    ms_har += record_timing(timers, segment_timers, measurement_active, "body110_har", time.perf_counter() - tick) * 1000.0
                     probability_history[track_id].append(probability)
                     smooth = np.mean(probability_history[track_id], axis=0)
                     class_id = int(np.argmax(smooth))
@@ -1032,7 +1348,7 @@ def main(argv: Optional[List[str]] = None):
                     face_system.forget_track(track_id)
 
             elapsed = max(time.perf_counter() - frame_started, 1e-6)
-            ms_total = record_timing(timers, segment_timers, pipeline_recording, "total_frame", elapsed) * 1000.0
+            ms_total = record_timing(timers, segment_timers, measurement_active, "total_frame", elapsed) * 1000.0
             fps = 1.0 / elapsed
             fps_ema = fps if fps_ema == 0 else 0.9 * fps_ema + 0.1 * fps
             dominant_activity = "collecting"
@@ -1054,6 +1370,28 @@ def main(argv: Optional[List[str]] = None):
                 frame, f"OFF-BOARD | {args.profile} | {fps_ema:.1f} FPS | {args.source}",
                 (12, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
             )
+            if experiment_enabled:
+                if pipeline_recording and experiment_phase == "warmup":
+                    remain = max(float(args.experiment_warmup) - (time.perf_counter() - recording_started), 0.0)
+                    status = (f"UJI {args.experiment_people} ORANG | REP {recording_index}/{args.experiment_repetitions} "
+                              f"| WARM-UP {remain:.1f}s")
+                    status_color = (0, 255, 255)
+                elif pipeline_recording and experiment_phase == "measure" and measurement_started is not None:
+                    remain = max(float(args.experiment_duration) - (time.perf_counter() - measurement_started), 0.0)
+                    status = (f"UJI {args.experiment_people} ORANG | REP {recording_index}/{args.experiment_repetitions} "
+                              f"| MEASURE {remain:.1f}s")
+                    status_color = (0, 255, 0)
+                elif recording_index >= max(int(args.experiment_repetitions), 1):
+                    status = f"UJI {args.experiment_people} ORANG | SELESAI {recording_index}/{args.experiment_repetitions}"
+                    status_color = (0, 255, 0)
+                else:
+                    status = (f"UJI {args.experiment_people} ORANG | SIAP REP {recording_index + 1}/{args.experiment_repetitions} "
+                              f"| E = START")
+                    status_color = (255, 255, 255)
+                cv2.putText(
+                    frame, status, (12, text_y + 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, status_color, 2, cv2.LINE_AA,
+                )
             if args.source == "tello":
                 frame = source.overlay(frame)
             if writer is not None:
@@ -1061,88 +1399,28 @@ def main(argv: Optional[List[str]] = None):
             if segment_writer is not None:
                 segment_writer.write(frame)
                 recording_frames += 1
+                if measurement_active:
+                    measurement_frames += 1
             if not args.no_display:
                 cv2.imshow("Full Off-board HAR UAV", frame)
             key = cv2.waitKey(1) & 0xFF
+
+            # Eksperimen berhenti otomatis setelah durasi measurement tercapai.
+            if (experiment_enabled and pipeline_recording and measurement_active
+                    and measurement_started is not None
+                    and time.perf_counter() - measurement_started >= float(args.experiment_duration)):
+                stop_tello_segment("auto_duration")
+                key = 0
+
             if args.source == "tello":
-                # E = START/STOP segmen. START mereset seluruh state eksperimen
-                # (tracker + mapping ID + buffer HAR + pose + prediksi + wajah)
-                # tanpa memutus koneksi Tello. Selama segmen berjalan tracker
-                # tidak di-reset sehingga ID stabil.
                 if key in (ord("e"), ord("E")):
                     if not pipeline_recording:
-                        recording_index += 1
-                        pipeline_recording = True
-                        recording_frames = 0
-                        recording_started = time.perf_counter()
-                        segment_timers = ModuleTimer()
-                        segment_video_path = (
-                            session_dir / f"recording_{recording_index:03d}.mp4"
-                        )
-                        segment_report_path = (
-                            session_dir / f"benchmark_{recording_index:03d}.json"
-                        )
-
-                        old_tracks = set(last_seen) | set(last_face)
-                        tracker = make_tracker(args)
-                        display_used.clear()
-                        next_display = 1
-                        if reid is not None:
-                            reid.reset()
-                        for store in (raw_buffers, mask_buffers, probability_history):
-                            store.clear()
-                        samples_seen.clear()
-                        last_seen.clear()
-                        last_pose.clear()
-                        last_prediction.clear()
-                        last_face.clear()
-                        if face_system is not None:
-                            for tid in old_tracks:
-                                face_system.forget_track(tid)
-
-                        segment_writer = H264Mp4Writer(
-                            str(segment_video_path), w, h,
-                            fps=max(min(source.fps, 30.0), 1.0),
-                        )
-                        csv_logger.begin_segment(recording_index)
-
-                        print()
-                        print("=" * 72)
-                        print(f"[REC START] Rekaman #{recording_index:03d}")
-                        print("Video :", segment_video_path.resolve())
-                        print("Report:", segment_report_path.resolve())
-                        print("State eksperimen di-reset; Tello tetap terhubung.")
-                        print("Tekan E lagi untuk STOP dan menyimpan segmen ini.")
-                        print("=" * 72)
+                        start_tello_segment(w, h)
+                    elif experiment_enabled:
+                        print("[INFO] Eksperimen sedang berjalan; STOP akan dilakukan otomatis.")
                     else:
-                        pipeline_recording = False
-                        if segment_writer is not None:
-                            segment_writer.close()
-                            segment_writer = None
-                        write_recording_report(
-                            segment_report_path,
-                            segment_video_path,
-                            recording_index,
-                            recording_frames,
-                            recording_started,
-                            profile,
-                            tracker,
-                            detector,
-                            pose_model,
-                            har_session,
-                            face_system,
-                            segment_timers,
-                            args,
-                        )
-                        finalize_segment(recording_index, multi=True)
-                        recording_started = None
-                        segment_timers = None
-                        segment_video_path = None
-                        segment_report_path = None
-                        recording_frames = 0
-
-                    # Rekaman dikelola pipeline; jangan diteruskan ke
-                    # VideoHandler (tello_control.py) supaya tidak rekam ganda.
+                        stop_tello_segment("manual")
+                    # E dikelola pipeline; jangan diteruskan ke VideoHandler.
                     key = 0
                 quit_now = source.process_control(key, frame)
                 if quit_now:
@@ -1158,6 +1436,11 @@ def main(argv: Optional[List[str]] = None):
             if args.max_frames > 0 and frame_index >= args.max_frames:
                 break
     finally:
+        # Finalisasi terlebih dahulu sebelum logger ditutup.
+        if args.source == "tello" and pipeline_recording:
+            stop_tello_segment("program_exit")
+        if args.source != "tello" and csv_logger.agg is not None:
+            finalize_segment(1, multi=False)
         source.close()
         if writer is not None:
             writer.close()
@@ -1166,31 +1449,24 @@ def main(argv: Optional[List[str]] = None):
         csv_logger.close()
         cv2.destroyAllWindows()
 
-    # Jika keluar (q) saat rekaman masih aktif, finalisasi segmen terakhir
-    # agar video + report tidak hilang.
-    if (args.source == "tello" and pipeline_recording
-            and segment_video_path is not None and segment_report_path is not None):
-        write_recording_report(
-            segment_report_path, segment_video_path, recording_index,
-            recording_frames, recording_started, profile, tracker,
-            detector, pose_model, har_session, face_system, segment_timers,
-            args,
-        )
-        finalize_segment(recording_index, multi=True)
-
-    # Non-Tello: seluruh run = satu segmen laporan.
-    if args.source != "tello" and csv_logger.agg is not None:
-        finalize_segment(1, multi=False)
-
     wall_time = max(time.perf_counter() - started_all, 1e-6)
     report = {
         "run_id": run_id,
-        "video_output": str(args.output),
-        "report_output": str(args.report),
+        "video_output": None if args.source == "tello" else str(args.output),
+        "report_output": str(session_report_path),
         "architecture": "off-board",
         "source": args.source,
         "profile": args.profile,
         "profile_values": profile.__dict__,
+        "experiment": {
+            "enabled": experiment_enabled,
+            "expected_people": int(args.experiment_people or 0),
+            "repetitions": int(args.experiment_repetitions or 0),
+            "warmup_seconds": float(args.experiment_warmup or 0.0),
+            "measurement_seconds": float(args.experiment_duration or 0.0),
+            "activity_plan": str(args.experiment_activity or ""),
+        },
+        "segments": segment_entries,
         "tracker": {
             "name": "ByteTrack",
             "track_high_thresh": tracker.track_high_thresh,

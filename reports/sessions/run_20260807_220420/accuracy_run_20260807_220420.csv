@@ -1,4 +1,0 @@
-segment_index,activity,support,correct,recall_pct,predicted,precision_pct
-1,ALL,4,0,0.0,4,0.0
-1,walking,2,0,0.0,1,0.0
-1,waving,2,0,0.0,1,0.0

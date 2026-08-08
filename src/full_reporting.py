@@ -34,8 +34,10 @@ SEGMENT_MODULES = [
     ("ms_total", "total"),
 ]
 SEGMENT_STATS_COLUMNS = [
-    "segment_index", "duration_s", "processed_frames", "n_people_avg",
-    "n_people_max", "throughput_fps", "fps_mean", "fps_p95",
+    "segment_index", "expected_people", "activity_plan",
+    "duration_s", "processed_frames", "n_people_avg", "n_people_max",
+    "people_match_frames", "people_match_ratio_pct",
+    "throughput_fps", "fps_mean", "fps_p95",
     "n_detections", "detection_rate",
     "dominant_activity", "dominant_activity_pct", "activity_dist",
     "n_tracks", "mean_track_duration_s", "pose_valid_ratio",
@@ -177,16 +179,23 @@ def build_segment_stats_row(agg: dict, n_tracks: int,
         for k, v in sorted(agg["activity"].items(), key=lambda kv: -kv[1])
     ) if dist_total else ""
 
-    duration = max(agg.get("end_t", 0) - agg.get("start_t", 0), 1e-6) if agg.get("start_t") else 0.0
+    duration = max(agg.get("end_t", 0) - agg.get("start_t", 0), 1e-6) if agg.get("start_t") is not None else 0.0
     n_frames = agg.get("n_frames", 0)
     track_durs = [agg["last_t"][t] - agg["first_t"][t] for t in agg.get("first_t", {})]
 
+    expected_people = int(agg.get("expected_people", 0) or 0)
+    people_match_frames = int(agg.get("people_match_frames", 0) or 0)
     row = {
         "segment_index": agg.get("segment_index", 1),
+        "expected_people": expected_people if expected_people else "",
+        "activity_plan": agg.get("activity_plan", ""),
         "duration_s": _r(duration),
         "processed_frames": n_frames,
         "n_people_avg": _r(agg.get("people_sum", 0) / n_frames) if n_frames else 0,
         "n_people_max": agg.get("people_max", 0),
+        "people_match_frames": people_match_frames if expected_people else "",
+        "people_match_ratio_pct": _r(people_match_frames / n_frames * 100)
+        if expected_people and n_frames else "",
         "throughput_fps": _r(n_frames / duration) if duration else 0,
         "fps_mean": _r(np.mean(agg["fps_samples"])) if agg.get("fps_samples") else 0,
         "fps_p95": _r(np.percentile(agg["fps_samples"], 95)) if agg.get("fps_samples") else 0,
@@ -351,6 +360,14 @@ def write_run_manifest(run_id: str, session_id: str, args, profile,
                 "reid_iou": args.reid_iou,
                 "reid_retired_cos": args.reid_retired_cos,
                 "reid_max_missed": args.reid_max_missed,
+            },
+            "experiment": {
+                "enabled": bool(getattr(args, "experiment_people", 0)),
+                "expected_people": int(getattr(args, "experiment_people", 0) or 0),
+                "repetitions": int(getattr(args, "experiment_repetitions", 0) or 0),
+                "warmup_seconds": float(getattr(args, "experiment_warmup", 0.0) or 0.0),
+                "measurement_seconds": float(getattr(args, "experiment_duration", 0.0) or 0.0),
+                "activity_plan": str(getattr(args, "experiment_activity", "") or ""),
             },
         },
         "env": {**pkg_versions(), "git_commit": git_commit()},

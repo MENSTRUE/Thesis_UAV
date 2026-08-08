@@ -1,4 +1,0 @@
-segment_index,second,n_frames,n_people_avg,n_detections,dominant_activity,dominant_activity_pct,activity_counts,dominant_face,dominant_face_count,ms_detector,ms_bytetrack,ms_pose,ms_body110_har,ms_face_liveness,ms_total,fps_avg
-1,0,11,0.0,0,,0.0,,,0,78.93,0.01,0.0,0.0,0.0,82.53,12.12
-1,1,30,0.0,0,,0.0,,,0,21.06,0.01,0.0,0.0,0.0,23.95,41.75
-1,2,19,0.0,0,,0.0,,,0,19.54,0.01,0.0,0.0,0.0,22.21,45.02

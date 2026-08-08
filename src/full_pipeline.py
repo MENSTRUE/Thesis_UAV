@@ -236,11 +236,23 @@ def make_ort_session(path: Path):
     return session
 
 
+def _open_capture(source):
+    """Buka VideoCapture dengan fallback backend (MSMF -> DSHOW -> FFMPEG).
+    isOpened() saja tidak cukup: MSMF bisa "terbuka" namun read() gagal
+    (error -2147467263), jadi frame pertama ikut diuji."""
+    for flag in (cv2.CAP_ANY, cv2.CAP_DSHOW, cv2.CAP_FFMPEG):
+        cap = cv2.VideoCapture(source, flag)
+        if cap.isOpened() and cap.read()[0]:
+            return cap
+        cap.release()
+    raise RuntimeError(f"Sumber tidak dapat dibuka: {source}")
+
+
 class OpenCVSource:
     def __init__(self, source):
-        self.capture = cv2.VideoCapture(source)
-        if not self.capture.isOpened():
-            raise RuntimeError(f"Sumber tidak dapat dibuka: {source}")
+        # MSMF sering gagal (error -2147467263) untuk kamera tertentu;
+        # DSHOW/FFMPEG jadi fallback backend.
+        self.capture = _open_capture(source)
         self.fps = float(self.capture.get(cv2.CAP_PROP_FPS))
         if not np.isfinite(self.fps) or self.fps <= 0:
             self.fps = 30.0

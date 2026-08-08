@@ -83,6 +83,8 @@ class TrackReId:
             for bid, t in self.by_byte.items():
                 if t["subject_id"] in assigned:
                     continue
+                if t["emb"] is None:
+                    continue
                 s = self._score(emb, t["emb"], bbox, t["bbox"])
                 if s > best_score:
                     best_score, best_id = s, t["subject_id"]
@@ -90,9 +92,16 @@ class TrackReId:
                 for sid, r_emb in self.retired:
                     if sid in assigned:
                         continue
+                    if r_emb is None:
+                        continue
                     if float(np.dot(emb, r_emb)) > self.retired_cos:
                         best_id = sid
                         break
+            if best_id is None:
+                # Track yang sebelumnya tanpa wajah: id passthrough sudah ditetapkan.
+                prev = self.by_byte.get(byte_id)
+                if prev is not None and prev["emb"] is None:
+                    best_id = prev["subject_id"]
             if best_id is None:
                 best_id = self.next_id
                 self.next_id += 1
@@ -103,15 +112,14 @@ class TrackReId:
             }
             result[byte_id] = best_id
 
-        # 2) Byte track tanpa wajah: fallback ByteTrack (passthrough id baru).
+        # 2) Byte track tanpa wajah: fallback ByteTrack (subject_id = byte_id).
         for byte_id, bbox in bbox_map.items():
             if byte_id in result:
                 continue
             t = self.by_byte.get(byte_id)
             if t is None:
-                t = {"subject_id": self.next_id, "emb": None, "bbox": bbox,
+                t = {"subject_id": byte_id, "emb": None, "bbox": bbox,
                      "missed": 0}
-                self.next_id += 1
                 self.by_byte[byte_id] = t
             t["bbox"] = bbox
             t["missed"] = 0
@@ -189,4 +197,9 @@ if __name__ == "__main__":
     ids3 = tr.update({1: {"embedding": e1, "face_box": (5, 5, 55, 55)}}, {})
     assert ids3 == {1: 1}, f"re-ID ke id lama ({ids3})"
     assert tr.n_known == 2
+    # Track tanpa wajah dulu, lalu dapat wajah: tidak boleh crash (emb None).
+    tr2 = TrackReId()
+    tr2.update({}, {9: (0, 0, 50, 50)})
+    ids4 = tr2.update({9: {"embedding": e1, "face_box": (5, 5, 55, 55)}}, {9: (5, 5, 55, 55)})
+    assert ids4 == {9: 9}, f"track tanpa-wajah -> wajah: id tetap ({ids4})"
     print("[OK] track_reid self-check passed")

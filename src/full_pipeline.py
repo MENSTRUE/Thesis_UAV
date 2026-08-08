@@ -70,6 +70,11 @@ except ImportError:
                                    SPEED_MODES, VideoHandler, load_config,
                                    rc_from_state, save_config)
 
+try:
+    from track_reid import ReIdFaceSystem, TrackReId
+except ImportError:
+    from src.track_reid import ReIdFaceSystem, TrackReId
+
 
 SEQUENCE_LENGTH = 30
 HAR_MIN_VALID_FRAMES = 20
@@ -144,6 +149,14 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--face-threshold", type=float, default=0.275,
                         help="cosine similarity (EER centroid = 0.275)")
     parser.add_argument("--liveness-threshold", type=float, default=0.6)
+    parser.add_argument("--reid-cos", type=float, default=0.25,
+                        help="cosine similarity face embedding utk match subject aktif")
+    parser.add_argument("--reid-iou", type=float, default=0.35,
+                        help="IoU bbox utk match subject aktif")
+    parser.add_argument("--reid-retired-cos", type=float, default=0.30,
+                        help="cosine utk re-ID subjek yang keluar-masuk frame")
+    parser.add_argument("--reid-max-missed", type=int, default=30,
+                        help="frame tanpa match sebelum subject dipindah ke pool retired")
     parser.add_argument("--output", type=Path, default=None,
                         help="Path video output. Jika kosong, dibuat otomatis per run.")
     parser.add_argument("--report", type=Path, default=None,
@@ -500,7 +513,8 @@ class CsvLogger:
     """
 
     DETECTION_COLUMNS = [
-        "frame_index", "t_run_s", "track_id", "x1", "y1", "x2", "y2",
+        "frame_index", "t_run_s", "byte_track_id", "subject_id",
+        "x1", "y1", "x2", "y2",
         "det_conf", "activity", "activity_score", "pose_valid",
         "face_identity", "face_similarity", "liveness", "liveness_score",
     ]
@@ -545,8 +559,8 @@ class CsvLogger:
         self.agg = None
         return agg if agg is not None else {}
 
-    def detection(self, frame_index, t_sec, track_id, box, det_conf,
-                  activity, activity_score, pose_valid, face):
+    def detection(self, frame_index, t_sec, byte_track_id, subject_id, box,
+                  det_conf, activity, activity_score, pose_valid, face):
         x1, y1, x2, y2 = map(int, box)
         if face is None:
             identity, similarity, liveness, liveness_score = "", "", "", ""
@@ -554,7 +568,8 @@ class CsvLogger:
             identity, similarity = face["identity"], f"{face['similarity']:.3f}"
             liveness, liveness_score = face["liveness"], f"{face['liveness_score']:.3f}"
         self._det_writer.writerow([
-            frame_index, f"{t_sec:.3f}", track_id, x1, y1, x2, y2,
+            frame_index, f"{t_sec:.3f}", byte_track_id, subject_id,
+            x1, y1, x2, y2,
             f"{float(det_conf):.3f}", activity, f"{float(activity_score):.3f}",
             pose_valid, identity, similarity, liveness, liveness_score,
         ])
@@ -572,8 +587,8 @@ class CsvLogger:
         acc["scores"].append(float(activity_score))
         a["pose_valid"] += int(bool(pose_valid))
         a["pose_total"] += 1
-        a["first_t"].setdefault(track_id, t_sec)
-        a["last_t"][track_id] = t_sec
+        a["first_t"].setdefault(subject_id, t_sec)
+        a["last_t"][subject_id] = t_sec
 
         sec = int(t_sec)
         s = a["seconds"].setdefault(sec, {
@@ -716,11 +731,15 @@ def main(argv: Optional[List[str]] = None):
     if args.labels is not None:
         require_file(args.labels, "ground truth labels")
     face_system = None
+    reid = None
     if args.enable_face:
-        from face_system import FaceSystem
-        face_system = FaceSystem(
+        face_system = ReIdFaceSystem(
             args.face_assets, args.face_model, args.face_det_size,
             args.face_threshold, args.liveness_threshold,
+        )
+        reid = TrackReId(
+            cos_thresh=args.reid_cos, iou_thresh=args.reid_iou,
+            retired_cos=args.reid_retired_cos, max_missed=args.reid_max_missed,
         )
     source = make_source(args)
 
@@ -761,10 +780,10 @@ def main(argv: Optional[List[str]] = None):
     writer = None
     csv_logger = CsvLogger(session_dir)
 
-    # Display ID: internal ByteTrack ID bisa besar; yang ditampilkan di
+    # Display ID: subject_id (stabil antar re-ID) yang ditampilkan di
     # overlay/HAR/face/CSV adalah 1, 2, 3, ... Mapping di-reset tiap START
     # rekaman (bersamaan dengan reset tracker).
-    display_ids = {}
+    display_used = {}
     next_display = 1
 
     frame_index = 0
@@ -795,7 +814,7 @@ def main(argv: Optional[List[str]] = None):
     def finalize_segment(seg_index, multi):
         """Tutup agregat segmen, tulis CSV laporan, akumulasi baris agregat."""
         agg = csv_logger.end_segment()
-        stat_row = build_segment_stats_row(agg, len(display_ids), labels)
+        stat_row = build_segment_stats_row(agg, len(display_used), labels)
         segment_stat_rows.append(stat_row)
         activity_rows.extend(build_activity_rows(agg))
         identity_rows.extend(build_identity_rows(agg))
@@ -894,6 +913,17 @@ def main(argv: Optional[List[str]] = None):
                 last_face.update(face_system.process(frame, current_boxes))
                 ms_face = record_timing(timers, segment_timers, pipeline_recording, "face_liveness", time.perf_counter() - tick) * 1000.0
 
+            # Re-ID ByteTrack -> subject_id stabil: track lama yang keluar-masuk
+            # frame tetap dianggap subjek yang sama (embedding wajah).
+            if reid is not None and current_boxes:
+                face_map = {
+                    tid: face for tid, face in last_face.items()
+                    if tid in current_boxes
+                }
+                subject_of = reid.update(face_map, current_boxes)
+            else:
+                subject_of = {tid: tid for tid in current_boxes}
+
             appended_this_frame = set()
             for box, det_conf, track_id in detections:
                 track_id = int(track_id)
@@ -912,10 +942,13 @@ def main(argv: Optional[List[str]] = None):
                     last_pose.pop(track_id, None)
                     last_prediction.pop(track_id, None)
 
-                if track_id not in display_ids:
-                    display_ids[track_id] = next_display
+                # Display/reporting memakai subject_id (stabil antar re-ID);
+                # HAR temporal tetap keyed ByteTrack + reset saat gap.
+                subject_id = subject_of.get(track_id, track_id)
+                if subject_id not in display_used:
+                    display_used[subject_id] = next_display
                     next_display += 1
-                display = display_ids[track_id]
+                display = display_used[subject_id]
 
                 run_pose = frame_index % profile.pose_interval == 0 or track_id not in last_pose
                 if run_pose:
@@ -975,13 +1008,13 @@ def main(argv: Optional[List[str]] = None):
                 draw_box_and_text(frame, box, lines, box_color)
                 csv_logger.detection(
                     frame_index, time.perf_counter() - started_all,
-                    display, box, det_conf, activity, activity_score,
-                    valid_pose_frames, last_face.get(track_id),
+                    track_id, subject_id, box, det_conf, activity,
+                    activity_score, valid_pose_frames, last_face.get(track_id),
                 )
 
             stale = [track_id for track_id, seen in last_seen.items() if frame_index - seen > TRACK_STALE_FRAMES]
             for track_id in stale:
-                for store in [raw_buffers, mask_buffers, probability_history, samples_seen, last_seen, last_pose, last_prediction, last_face, display_ids]:
+                for store in [raw_buffers, mask_buffers, probability_history, samples_seen, last_seen, last_pose, last_prediction, last_face]:
                     store.pop(track_id, None)
                 if face_system is not None:
                     face_system.forget_track(track_id)
@@ -1040,8 +1073,10 @@ def main(argv: Optional[List[str]] = None):
 
                         old_tracks = set(last_seen) | set(last_face)
                         tracker = make_tracker(args)
-                        display_ids.clear()
+                        display_used.clear()
                         next_display = 1
+                        if reid is not None:
+                            reid.reset()
                         for store in (raw_buffers, mask_buffers, probability_history):
                             store.clear()
                         samples_seen.clear()

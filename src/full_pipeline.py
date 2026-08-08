@@ -957,6 +957,35 @@ def main(argv: Optional[List[str]] = None):
     segment_entries = []
     reported_files = []
 
+    def refresh_bab4_summary():
+        """Perbarui summary global + summary skenario saat ini.
+
+        Dipanggil setelah setiap pengulangan selesai, jadi pengguna tidak perlu
+        menutup program untuk melihat SUMMARY_1_ORANG / SUMMARY_2_ORANG / dst.
+        """
+        if not experiment_enabled:
+            return None
+        try:
+            import importlib.util as _ilu
+
+            export_script = Path(__file__).resolve().parents[1] / "scripts" / "export_pipeline.py"
+            spec = _ilu.spec_from_file_location("export_pipeline", export_script)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("export_pipeline.py tidak ditemukan")
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            summary_path = mod.build(
+                current_run=session_dir,
+                current_people=int(args.experiment_people),
+            )
+            local = session_dir / f"SUMMARY_{int(args.experiment_people)}_ORANG.html"
+            print("[OK] Summary global :", summary_path.resolve())
+            print("[OK] Summary skenario:", local.resolve())
+            return local
+        except Exception as exc:
+            print(f"[!] Summary generator gagal: {exc}")
+            return None
+
     def finalize_segment(seg_index, multi):
         """Tutup agregat measurement, tulis CSV laporan, akumulasi hasil."""
         agg = csv_logger.end_segment()
@@ -1151,6 +1180,11 @@ def main(argv: Optional[List[str]] = None):
             detector, pose_model, har_session, face_system, segment_timers,
             args, stop_reason=reason,
         )
+
+        # Summary dibuat SEKARANG, setelah benchmark rep selesai ditulis.
+        # Jadi REP 1 langsung menghasilkan SUMMARY_1_ORANG.html tanpa menunggu ESC.
+        if experiment_enabled:
+            refresh_bab4_summary()
 
         if experiment_enabled:
             done = recording_index >= max(int(args.experiment_repetitions), 1)
@@ -1510,20 +1544,10 @@ def main(argv: Optional[List[str]] = None):
         print("[OK] Manifest:", manifest_path.resolve())
         print("[OK] Reports :", reports_session_dir.resolve())
 
-        try:
-            import importlib.util as _ilu
-
-            export_script = Path(__file__).resolve().parents[1] / "scripts" / "export_pipeline.py"
-            spec = _ilu.spec_from_file_location("export_pipeline", export_script)
-            if spec is None or spec.loader is None:
-                raise RuntimeError("export_pipeline.py tidak ditemukan")
-            mod = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-            summary_path = mod.build()
-            print("[OK] Summary :", summary_path.resolve())
-        except Exception as exc:
-            print(f"[!] Summary generator gagal: {exc}")
+        # Refresh terakhir ketika sesi ditutup. Pada mode eksperimen summary juga
+        # sudah diperbarui setiap REP selesai.
+        if experiment_enabled:
+            refresh_bab4_summary()
 
 
 if __name__ == "__main__":

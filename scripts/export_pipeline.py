@@ -456,7 +456,73 @@ th,td{{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;whit
 </main></body></html>"""
 
 
-def build() -> Path:
+def _filter_current_run(scenarios, repetitions, subjects, timelines, current_run: Path, current_people: int):
+    run_id = current_run.name
+    reps = [r for r in repetitions if r.get("scenario_people") == current_people and r.get("run_id") == run_id]
+    subs = [r for r in subjects if r.get("scenario_people") == current_people and r.get("run_id") == run_id]
+    tls = [r for r in timelines if r.get("scenario_people") == current_people and r.get("run_id") == run_id]
+    scs = [r for r in scenarios if r.get("scenario_people") == current_people and r.get("run_id") == run_id]
+    return scs, reps, subs, tls
+
+
+def _write_current_run_summary(current_run: Path, current_people: int, scenarios, repetitions, subjects, timelines) -> Path:
+    current_run.mkdir(parents=True, exist_ok=True)
+    scs, reps, subs, tls = _filter_current_run(
+        scenarios, repetitions, subjects, timelines, current_run, current_people
+    )
+    prefix = f"SUMMARY_{current_people}_ORANG"
+
+    _write_csv(current_run / f"{prefix}_REPETITIONS.csv", reps)
+    _write_csv(current_run / f"{prefix}_SUBJECTS.csv", subs)
+    _write_csv(current_run / f"{prefix}_ACTIVITY_TIMELINE.csv", tls)
+
+    payload = {
+        "scenario_people": current_people,
+        "run_id": current_run.name,
+        "scenarios": scs,
+        "repetitions": reps,
+        "subjects": subs,
+        "activity_timeline": tls,
+        "notes": {
+            "generated_incrementally": True,
+            "face_system_modified": False,
+            "activity_field": "activity",
+            "activity_score_field": "activity_score",
+            "stable_subject_field": "subject_id",
+            "temporary_track_field": "byte_track_id",
+            "face_identity_field": "face_identity",
+            "face_similarity_field": "face_similarity",
+            "liveness_fields": ["liveness", "liveness_score"],
+        },
+    }
+    (current_run / f"{prefix}.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    html_path = current_run / f"{prefix}.html"
+    html_path.write_text(_build_html(scs, reps, subs, tls), encoding="utf-8")
+
+    # Shortcut pada folder skenario agar tidak perlu masuk ke run_... untuk mencari summary terbaru.
+    scenario_dir = current_run.parent
+    latest_prefix = f"SUMMARY_TERBARU_{current_people}_ORANG"
+    (scenario_dir / f"{latest_prefix}.html").write_text(
+        _build_html(scs, reps, subs, tls), encoding="utf-8"
+    )
+    (scenario_dir / f"{latest_prefix}.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    _write_csv(scenario_dir / f"{latest_prefix}_REPETITIONS.csv", reps)
+    _write_csv(scenario_dir / f"{latest_prefix}_SUBJECTS.csv", subs)
+    _write_csv(scenario_dir / f"{latest_prefix}_ACTIVITY_TIMELINE.csv", tls)
+    return html_path
+
+
+def build(current_run: Optional[Path] = None, current_people: Optional[int] = None) -> Path:
+    """Bangun report global BAB IV dan, bila diberikan, summary run saat ini.
+
+    Report global selalu ditulis ke ``output/uav_final``. Summary skenario/run
+    ditulis segera agar setelah REP 1 selesai pengguna sudah dapat melihat hasil,
+    tanpa harus menutup program terlebih dahulu.
+    """
     UAV_ROOT.mkdir(parents=True, exist_ok=True)
     scenarios, repetitions, subjects, timelines = _collect()
 
@@ -486,6 +552,11 @@ def build() -> Path:
 
     html_path = UAV_ROOT / "REPORT_BAB4.html"
     html_path.write_text(_build_html(scenarios, repetitions, subjects, timelines), encoding="utf-8")
+
+    if current_run is not None and current_people is not None:
+        _write_current_run_summary(
+            Path(current_run), int(current_people), scenarios, repetitions, subjects, timelines
+        )
     return html_path
 
 

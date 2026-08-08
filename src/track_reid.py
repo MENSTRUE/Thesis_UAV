@@ -73,7 +73,9 @@ class TrackReId:
         # 1) Track dengan wajah: match ke subject aktif / re-ID retired / baru.
         for byte_id, face in face_map.items():
             emb = normalize_embedding(np.asarray(face["embedding"], dtype=np.float32))
-            bbox = face.get("face_box") or bbox_map.get(byte_id)
+            bbox = face.get("face_box")
+            if bbox is None:
+                bbox = bbox_map.get(byte_id)
             if bbox is None:
                 continue
 
@@ -169,7 +171,7 @@ class ReIdFaceSystem(FaceSystem):
 if __name__ == "__main__":
     e1 = np.array([1.0, 0.0, 0.0, 0.0])
     e2 = np.array([0.0, 1.0, 0.0, 0.0])
-    b1, b2 = (0, 0, 50, 50), (100, 0, 150, 50)
+    b1, b2 = np.array([0, 0, 50, 50]), np.array([100, 0, 150, 50])
     tr = TrackReId()
     ids0 = tr.update(
         {1: {"embedding": e1, "face_box": b1}, 2: {"embedding": e2, "face_box": b2}},

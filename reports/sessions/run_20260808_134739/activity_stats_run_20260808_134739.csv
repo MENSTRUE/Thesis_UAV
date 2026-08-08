@@ -1,0 +1,3 @@
+segment_index,activity,n_detections,pct_time,mean_score,p95_score,max_score
+1,walking,153,88.95,0.95,0.99,0.99
+1,collecting,19,11.05,0.0,0.0,0.0
